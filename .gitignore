@@ -1,0 +1,62 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+*.manifest
+*.pyz
+*.pyzw
+*.exe
+*.msi
+
+# Supabase local CLI state
+supabase/.branches/
+supabase/.temp/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs, temporary files and local exports
+*.log
+*.tmp
+*.bak
+*.orig
+.cache/
+tmp/
+temp/
+exports/
+backups/
+*_backup.json
+*.backup
+
+# Design/test screenshots generated during local iterations
+codex-clipboard-*.png
+*_preview.png
