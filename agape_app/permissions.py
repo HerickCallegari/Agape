@@ -1,6 +1,6 @@
 ROLE_LABELS = {
     "admin": "Administrador",
-    "reception": "Recepcao",
+    "reception": "Recepção",
     "professional": "Profissional",
 }
 

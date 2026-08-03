@@ -22,6 +22,7 @@ ENV/
 # Build and packaging artifacts
 build/
 dist/
+release/
 *.egg-info/
 *.manifest
 *.pyz

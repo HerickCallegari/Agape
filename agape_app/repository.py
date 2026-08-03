@@ -20,6 +20,9 @@ class SupabaseRepository:
     DEFAULT_PROFESSIONAL_SPECIALTY = "Outra"
     DOCUMENTS_BUCKET = "professional-documents"
     MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024
+    SUPABASE_IN_FILTER_BATCH_SIZE = 75
+    NON_CHARGEABLE_APPOINTMENT_STATUSES = {"Cancelado", "Falta com aviso"}
+    NON_CHARGEABLE_FINANCIAL_STATUSES = {"Cortesia", "Cancelado"}
     DOCUMENT_MIME_TYPES = {
         ".pdf": "application/pdf",
         ".doc": "application/msword",
@@ -65,6 +68,13 @@ class SupabaseRepository:
         self.access_token: str | None = None
         self.profile: dict[str, Any] | None = None
 
+    def _batched_ids(self, values: list[str]) -> list[list[str]]:
+        cleaned = list(dict.fromkeys(value for value in values if value))
+        return [
+            cleaned[index : index + self.SUPABASE_IN_FILTER_BATCH_SIZE]
+            for index in range(0, len(cleaned), self.SUPABASE_IN_FILTER_BATCH_SIZE)
+        ]
+
     def login(self, email: str, password: str) -> dict[str, Any]:
         try:
             auth = self.client.auth.sign_in_with_password({"email": email, "password": password})
@@ -80,9 +90,9 @@ class SupabaseRepository:
                 .data
             )
         except Exception as exc:
-            raise AppError("Nao foi possivel entrar. Confira e-mail, senha e perfil ativo.") from exc
+            raise AppError("Não foi possível entrar. Confira e-mail, senha e perfil ativo.") from exc
         if not profile:
-            raise AppError("Este usuario nao possui perfil ativo no sistema.")
+            raise AppError("Este usuário não possui perfil ativo no sistema.")
         self.profile = profile
         return profile
 
@@ -115,7 +125,7 @@ class SupabaseRepository:
         appointments = self.client.table("appointments").select("id").eq("patient_id", record_id).limit(1).execute().data or []
         recurring = self.client.table("recurring_schedules").select("id").eq("patient_id", record_id).limit(1).execute().data or []
         if appointments or recurring:
-            raise AppError("Este paciente possui atendimentos vinculados. Inative o paciente para manter o historico.")
+            raise AppError("Este paciente possui atendimentos vinculados. Inative o paciente para manter o histórico.")
         self.client.table("patients").delete().eq("id", record_id).execute()
 
     def patient_appointments(self, patient_id: str) -> list[dict[str, Any]]:
@@ -224,10 +234,10 @@ class SupabaseRepository:
             raise AppError("Preencha o nome do profissional antes de salvar.")
         profile_id = values.get("profile_id")
         if not profile_id:
-            raise AppError("Vincule o profissional a um usuario com permissao Profissional.")
+            raise AppError("Vincule o profissional a um usuário com permissão Profissional.")
         profile = self.client.table("profiles").select("can_attend, is_active").eq("id", profile_id).single().execute().data
         if not profile or not profile.get("can_attend") or not profile.get("is_active"):
-            raise AppError("O usuario vinculado precisa estar ativo e marcado como capaz de realizar atendimentos.")
+            raise AppError("O usuário vinculado precisa estar ativo e marcado como capaz de realizar atendimentos.")
         if record_id:
             self.client.table("professionals").update(values).eq("id", record_id).execute()
         else:
@@ -290,7 +300,7 @@ class SupabaseRepository:
     def document_by_id(self, document_id: str) -> dict[str, Any]:
         row = self.client.table("documents").select("*").eq("id", document_id).single().execute().data
         if not row or not self._can_manage_document(row):
-            raise AppError("Documento nao encontrado ou sem permissao para acessar.")
+            raise AppError("Documento não encontrado ou sem permissão para acessar.")
         return row
 
     def upload_document(self, local_path: str, professional_id: str, description: str = "") -> None:
@@ -298,9 +308,9 @@ class SupabaseRepository:
             raise AppError("Entre no sistema antes de enviar documentos.")
         path = Path(local_path)
         if not path.exists() or not path.is_file():
-            raise AppError("Selecione um arquivo valido para enviar.")
+            raise AppError("Selecione um arquivo válido para enviar.")
         if not professional_id:
-            raise AppError("Selecione o profissional responsavel pelo documento.")
+            raise AppError("Selecione o profissional responsável pelo documento.")
         file_size = path.stat().st_size
         if file_size > self.MAX_DOCUMENT_SIZE_BYTES:
             raise AppError("O arquivo deve ter no maximo 20 MB para manter o sistema leve.")
@@ -317,7 +327,7 @@ class SupabaseRepository:
             )
         except Exception as exc:
             raise AppError(
-                "Nao foi possivel enviar o arquivo. Confira se o bucket 'professional-documents' existe no Supabase Storage."
+                "Não foi possível enviar o arquivo. Confira se o bucket 'professional-documents' existe no Supabase Storage."
             ) from exc
         payload = {
             "professional_id": professional_id,
@@ -341,7 +351,7 @@ class SupabaseRepository:
         try:
             data = self.client.storage.from_(self.DOCUMENTS_BUCKET).download(document["file_path"])
         except Exception as exc:
-            raise AppError("Nao foi possivel baixar o arquivo no Supabase Storage.") from exc
+            raise AppError("Não foi possível baixar o arquivo no Supabase Storage.") from exc
         Path(target_path).write_bytes(data)
 
     def delete_document(self, document_id: str) -> None:
@@ -349,7 +359,7 @@ class SupabaseRepository:
         try:
             self.client.storage.from_(self.DOCUMENTS_BUCKET).remove([document["file_path"]])
         except Exception as exc:
-            raise AppError("Nao foi possivel remover o arquivo no Supabase Storage.") from exc
+            raise AppError("Não foi possível remover o arquivo no Supabase Storage.") from exc
         self.client.table("documents").delete().eq("id", document_id).execute()
 
     def available_professional_profiles(self, include_profile_id: str | None = None) -> list[dict[str, Any]]:
@@ -364,13 +374,13 @@ class SupabaseRepository:
         full_name = values.get("full_name", "").strip()
         role = values.get("role", "")
         if not full_name:
-            raise AppError("Preencha o nome do usuario antes de salvar.")
+            raise AppError("Preencha o nome do usuário antes de salvar.")
         if not email:
-            raise AppError("Preencha o e-mail do usuario antes de salvar.")
+            raise AppError("Preencha o e-mail do usuário antes de salvar.")
         if len(password) < 6:
             raise AppError("A senha deve ter pelo menos 6 caracteres.")
         if role not in {"admin", "reception", "professional"}:
-            raise AppError("Escolha uma permissao valida para o usuario.")
+            raise AppError("Escolha uma permissão válida para o usuário.")
 
         try:
             response = httpx.post(
@@ -385,16 +395,16 @@ class SupabaseRepository:
             )
             data = response.json()
         except Exception as exc:
-            raise AppError("Nao foi possivel criar o login no Supabase Auth.") from exc
+            raise AppError("Não foi possível criar o login no Supabase Auth.") from exc
 
         if response.status_code >= 400:
-            message = data.get("msg") or data.get("message") or "Nao foi possivel criar o usuario."
+            message = data.get("msg") or data.get("message") or "Não foi possível criar o usuário."
             raise AppError(message)
 
         auth_user = data.get("user") or data
         auth_user_id = auth_user.get("id")
         if not auth_user_id:
-            raise AppError("O Supabase nao retornou o ID do usuario criado.")
+            raise AppError("O Supabase não retornou o ID do usuário criado.")
 
         profile_payload = {
             "auth_user_id": auth_user_id,
@@ -407,7 +417,7 @@ class SupabaseRepository:
         try:
             created = self.client.table("profiles").insert(profile_payload).execute().data
         except Exception as exc:
-            raise AppError("Login criado, mas nao foi possivel criar o perfil de permissoes.") from exc
+            raise AppError("Login criado, mas não foi possível criar o perfil de permissões.") from exc
         profile = created[0] if created else profile_payload
         if profile.get("can_attend"):
             self.ensure_professional_for_profile(profile)
@@ -416,7 +426,7 @@ class SupabaseRepository:
     def send_password_reset(self, email: str) -> None:
         email = email.strip()
         if not email:
-            raise AppError("Preencha o e-mail de login antes de enviar a redefinicao de senha.")
+            raise AppError("Preencha o e-mail de login antes de enviar a redefinição de senha.")
         try:
             response = httpx.post(
                 f"{self.settings.supabase_url}/auth/v1/recover",
@@ -430,19 +440,19 @@ class SupabaseRepository:
             )
             data = response.json() if response.content else {}
         except Exception as exc:
-            raise AppError("Nao foi possivel enviar a redefinicao de senha.") from exc
+            raise AppError("Não foi possível enviar a redefinição de senha.") from exc
 
         if response.status_code >= 400:
-            message = data.get("msg") or data.get("message") or "Nao foi possivel enviar a redefinicao de senha."
+            message = data.get("msg") or data.get("message") or "Não foi possível enviar a redefinição de senha."
             raise AppError(message)
 
     def update_user_password(self, auth_user_id: str, password: str) -> None:
         if not auth_user_id:
-            raise AppError("Usuario sem Auth ID vinculado.")
+            raise AppError("Usuário sem Auth ID vinculado.")
         if len(password) < 6:
             raise AppError("A nova senha deve ter pelo menos 6 caracteres.")
         if not self.access_token:
-            raise AppError("Sessao expirada. Entre novamente antes de trocar a senha.")
+            raise AppError("Sessão expirada. Entre novamente antes de trocar a senha.")
 
         try:
             response = httpx.post(
@@ -457,21 +467,21 @@ class SupabaseRepository:
             )
             data = response.json() if response.content else {}
         except Exception as exc:
-            raise AppError("Nao foi possivel trocar a senha pelo aplicativo.") from exc
+            raise AppError("Não foi possível trocar a senha pelo aplicativo.") from exc
 
         if response.status_code >= 400:
-            message = data.get("error") or data.get("message") or "Nao foi possivel trocar a senha."
+            message = data.get("error") or data.get("message") or "Não foi possível trocar a senha."
             raise AppError(message)
         if data.get("ok") is not True:
-            raise AppError(data.get("error") or "A funcao nao confirmou a troca da senha.")
+            raise AppError(data.get("error") or "A função não confirmou a troca da senha.")
 
     def update_profile_permissions(self, profile_id: str, values: dict[str, Any]) -> None:
         full_name = values.get("full_name", "").strip()
         role = values.get("role", "")
         if not full_name:
-            raise AppError("Preencha o nome do usuario antes de salvar.")
+            raise AppError("Preencha o nome do usuário antes de salvar.")
         if role not in {"admin", "reception", "professional"}:
-            raise AppError("Escolha uma permissao valida para o usuario.")
+            raise AppError("Escolha uma permissão válida para o usuário.")
         payload = {
             "full_name": full_name,
             "email": values.get("email", "").strip(),
@@ -492,7 +502,7 @@ class SupabaseRepository:
 
     def delete_profile(self, profile_id: str) -> None:
         if self.profile and self.profile.get("id") == profile_id:
-            raise AppError("Voce nao pode apagar o proprio usuario enquanto esta logado.")
+            raise AppError("Você não pode apagar o próprio usuário enquanto está logado.")
         self.client.table("profiles").delete().eq("id", profile_id).execute()
 
     def employee_profile_payload(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -550,7 +560,7 @@ class SupabaseRepository:
         if ignore_id:
             rows = [row for row in rows if row["id"] != ignore_id]
         if rows:
-            raise AppError("Este profissional ja possui um atendimento neste horario.")
+            raise AppError("Este profissional já possui um atendimento neste horário.")
 
     def appointment_values(self, values: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -575,9 +585,9 @@ class SupabaseRepository:
     def save_appointment(self, values: dict[str, Any], record_id: str | None = None) -> None:
         required = ["patient_id", "professional_id", "appointment_date", "start_time", "end_time", "status"]
         if any(not values.get(field) for field in required):
-            raise AppError("Preencha paciente, profissional, data, horario e status.")
+            raise AppError("Preencha paciente, profissional, data, horário e status.")
         if values["end_time"] <= values["start_time"]:
-            raise AppError("O horario final deve ser maior que o horario inicial.")
+            raise AppError("O horário final deve ser maior que o horário inicial.")
         self.assert_no_conflict(
             values["professional_id"],
             values["appointment_date"],
@@ -599,9 +609,98 @@ class SupabaseRepository:
             raise AppError("Escolha um status antes de salvar.")
         self.client.table("appointments").update({"status": status}).eq("id", appointment_id).execute()
 
+    def update_appointments_bulk(
+        self,
+        appointments: list[dict[str, Any]],
+        *,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        status: str | None = None,
+        consultation_fee: Any | None = None,
+    ) -> int:
+        if not appointments:
+            raise AppError("Selecione pelo menos um atendimento.")
+        if not any((start_time, end_time, status, consultation_fee is not None)):
+            raise AppError("Escolha pelo menos uma alteração para aplicar.")
+        if bool(start_time) != bool(end_time):
+            raise AppError("Informe os horários inicial e final.")
+        if start_time and end_time and end_time <= start_time:
+            raise AppError("O horário final deve ser maior que o horário inicial.")
+
+        normalized_fee = None
+        if consultation_fee is not None:
+            normalized_fee = self.parse_consultation_fee(consultation_fee)
+        selected_ids = {row["id"] for row in appointments}
+        changes: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+        for row in appointments:
+            target = {
+                "appointment_date": row["appointment_date"],
+                "start_time": start_time or row["start_time"],
+                "end_time": end_time or row["end_time"],
+                "status": status or row["status"],
+            }
+            payload: dict[str, Any] = {}
+            if start_time and end_time:
+                payload.update({"start_time": start_time, "end_time": end_time})
+            if status:
+                payload["status"] = status
+            conflicts = (
+                self.client.table("appointments")
+                .select("id")
+                .eq("professional_id", row["professional_id"])
+                .eq("appointment_date", target["appointment_date"])
+                .neq("status", "Cancelado")
+                .lt("start_time", target["end_time"])
+                .gt("end_time", target["start_time"])
+                .execute()
+                .data
+                or []
+            )
+            if any(item["id"] not in selected_ids for item in conflicts):
+                patient = (row.get("patients") or {}).get("full_name", "Paciente")
+                raise AppError(
+                    f"Conflito de agenda para {patient} em "
+                    f"{date.fromisoformat(target['appointment_date']).strftime('%d/%m/%Y')} "
+                    f"às {target['start_time'][:5]}. Nenhum atendimento foi alterado."
+                )
+            changes.append((row, payload, target))
+
+        for index, (row, _payload, target) in enumerate(changes):
+            if target["status"] == "Cancelado":
+                continue
+            for other_row, _other_payload, other_target in changes[index + 1 :]:
+                if other_target["status"] == "Cancelado":
+                    continue
+                if (
+                    row["professional_id"] == other_row["professional_id"]
+                    and target["appointment_date"] == other_target["appointment_date"]
+                    and target["start_time"] < other_target["end_time"]
+                    and target["end_time"] > other_target["start_time"]
+                ):
+                    raise AppError("As alterações criariam conflito entre dois atendimentos selecionados.")
+
+        fee_values = None
+        if consultation_fee is not None:
+            fee_values = {"consultation_fee": normalized_fee}
+        for row, payload, _target in changes:
+            if payload:
+                self.client.table("appointments").update(payload).eq("id", row["id"]).execute()
+            if fee_values is not None:
+                existing = self.appointment_financials(row["id"])
+                self.save_appointment_financials(
+                    row["id"],
+                    {
+                        **fee_values,
+                        "payment_status": (existing or {}).get("payment_status", "Pendente"),
+                        "payment_method": (existing or {}).get("payment_method", ""),
+                        "financial_notes": (existing or {}).get("financial_notes", ""),
+                    },
+                )
+        return len(changes)
+
     def delete_appointment(self, appointment_id: str) -> None:
         if not appointment_id:
-            raise AppError("Atendimento nao encontrado para exclusao.")
+            raise AppError("Atendimento não encontrado para exclusão.")
         self.client.table("appointments").delete().eq("id", appointment_id).execute()
 
     def session_note_for(self, appointment_id: str) -> dict[str, Any] | None:
@@ -610,7 +709,7 @@ class SupabaseRepository:
 
     def save_session_note(self, appointment: dict[str, Any], note: str) -> None:
         if self.profile is None:
-            raise AppError("Usuario sem perfil ativo.")
+            raise AppError("Usuário sem perfil ativo.")
         existing = self.session_note_for(appointment["id"])
         payload = {
             "appointment_id": appointment["id"],
@@ -663,11 +762,11 @@ class SupabaseRepository:
         start_date: date | None = None,
         end_date: date | None = None,
         balance_filter: str = "open",
+        include_non_chargeable: bool = False,
     ) -> list[dict[str, Any]]:
         query = (
             self.client.table("appointments")
             .select("*, patients(full_name), professionals(full_name), appointment_financials(*)")
-            .in_("status", ["Atendido", "Falta sem aviso"])
             .order("appointment_date")
             .order("start_time")
         )
@@ -689,11 +788,18 @@ class SupabaseRepository:
 
         balance_rows = []
         for row in rows:
-            fee = float(self.financial_row(row).get("consultation_fee") or 0)
-            if fee <= 0:
+            financial = self.financial_row(row)
+            chargeable = (
+                row.get("status") not in self.NON_CHARGEABLE_APPOINTMENT_STATUSES
+                and financial.get("payment_status") not in self.NON_CHARGEABLE_FINANCIAL_STATUSES
+            )
+            if not include_non_chargeable and not chargeable:
+                continue
+            fee = round(float(financial.get("consultation_fee") or 0), 2)
+            if not include_non_chargeable and fee <= 0:
                 continue
             paid = paid_by_appointment.get(row["id"], 0.0)
-            open_amount = max(fee - paid, 0)
+            open_amount = round(max(fee - paid, 0), 2) if chargeable and fee > 0 else 0.0
             is_open = open_amount > 0.009
             if balance_filter == "open" and not is_open:
                 continue
@@ -709,7 +815,6 @@ class SupabaseRepository:
         query = (
             self.client.table("appointments")
             .select("*, patients(full_name), professionals(full_name), appointment_financials(*)")
-            .in_("status", ["Atendido", "Falta sem aviso"])
             .lte("appointment_date", cutoff.isoformat())
             .order("appointment_date")
             .order("start_time")
@@ -717,30 +822,65 @@ class SupabaseRepository:
         if professional_id:
             query = query.eq("professional_id", professional_id)
         rows = query.execute().data or []
-        return [row for row in rows if self.financial_row(row).get("payment_status") != "Pago"]
+        return [
+            row
+            for row in rows
+            if row.get("status") not in self.NON_CHARGEABLE_APPOINTMENT_STATUSES
+            and self.financial_row(row).get("payment_status") not in {"Pago", *self.NON_CHARGEABLE_FINANCIAL_STATUSES}
+        ]
 
-    def patient_payments(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
-        return (
+    def patient_payments(self, start_date: date | None, end_date: date | None) -> list[dict[str, Any]]:
+        query = self.client.table("patient_payments").select("patient_id, amount")
+        if start_date:
+            query = query.gte("payment_date", start_date.isoformat())
+        if end_date:
+            query = query.lte("payment_date", end_date.isoformat())
+        return query.execute().data or []
+
+    def patient_payment_history(
+        self,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        patient_id: str | None = None,
+        professional_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = (
             self.client.table("patient_payments")
-            .select("patient_id, amount")
-            .gte("payment_date", start_date.isoformat())
-            .lte("payment_date", end_date.isoformat())
-            .execute()
-            .data
-            or []
+            .select("*, patients(full_name), patient_payment_items(amount, appointments(patient_id, professional_id))")
+            .order("payment_date", desc=True)
+            .order("created_at", desc=True)
         )
+        if start_date:
+            query = query.gte("payment_date", start_date.isoformat())
+        if end_date:
+            query = query.lte("payment_date", end_date.isoformat())
+        if patient_id:
+            query = query.eq("patient_id", patient_id)
+        rows = query.execute().data or []
+        if professional_id:
+            rows = [
+                row for row in rows
+                if any(
+                    (item.get("appointments") or {}).get("professional_id") == professional_id
+                    for item in row.get("patient_payment_items") or []
+                )
+            ]
+        return rows
 
     def patient_payment_items_for_appointments(self, appointment_ids: list[str]) -> list[dict[str, Any]]:
         if not appointment_ids:
             return []
-        return (
-            self.client.table("patient_payment_items")
-            .select("appointment_id, amount")
-            .in_("appointment_id", appointment_ids)
-            .execute()
-            .data
-            or []
-        )
+        rows: list[dict[str, Any]] = []
+        for batch in self._batched_ids(appointment_ids):
+            rows.extend(
+                self.client.table("patient_payment_items")
+                .select("appointment_id, amount")
+                .in_("appointment_id", batch)
+                .execute()
+                .data
+                or []
+            )
+        return rows
 
     def open_patient_payment_appointments(
         self,
@@ -754,112 +894,157 @@ class SupabaseRepository:
         )
 
     def patient_open_payment_appointments(self, patient_id: str) -> list[dict[str, Any]]:
-        return self.open_patient_payment_appointments(patient_id=patient_id)
+        rows = self.patient_payment_balance_appointments(
+            patient_id=patient_id,
+            balance_filter="all",
+            include_non_chargeable=True,
+        )
+        visible_rows = []
+        for row in rows:
+            financial = self.financial_row(row)
+            payment_status = str(financial.get("payment_status") or "").strip()
+            fee = float(financial.get("consultation_fee") or 0)
+            open_amount = float(row.get("_open_amount") or 0)
+            is_paid = payment_status == "Pago" or (fee > 0 and open_amount <= 0.009)
+            if not is_paid:
+                visible_rows.append(row)
+        return visible_rows
 
     def parse_money(self, value: Any, field_label: str = "valor") -> float:
-        text = str(value or "").strip().replace(".", "").replace(",", ".")
-        if not text:
-            raise AppError(f"Informe o {field_label}.")
-        try:
-            amount = float(text)
-        except ValueError as exc:
-            raise AppError(f"Informe um {field_label} valido.") from exc
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            amount = float(value)
+        else:
+            text = str(value or "").strip().replace("R$", "").replace(" ", "")
+            if not text:
+                raise AppError(f"Informe o {field_label}.")
+            if "," in text:
+                text = text.replace(".", "").replace(",", ".")
+            try:
+                amount = float(text)
+            except ValueError as exc:
+                raise AppError(f"Informe um {field_label} válido.") from exc
         if amount <= 0:
             raise AppError(f"O {field_label} deve ser maior que zero.")
         return amount
 
+    def parse_consultation_fee(self, value: Any) -> float | None:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            consultation_fee = float(value)
+        else:
+            fee_text = str(value).replace("R$", "").replace(" ", "").strip()
+            if "," in fee_text:
+                fee_text = fee_text.replace(".", "").replace(",", ".")
+            try:
+                consultation_fee = float(fee_text)
+            except ValueError as exc:
+                raise AppError("Informe um valor de consulta válido.") from exc
+        if consultation_fee < 0:
+            raise AppError("O valor da consulta não pode ser negativo.")
+        return consultation_fee
+
     def save_patient_payment(self, values: dict[str, Any], items: list[dict[str, Any]]) -> None:
         if self.profile is None:
-            raise AppError("Usuario sem perfil ativo.")
+            raise AppError("Usuário sem perfil ativo.")
         patient_id = values.get("patient_id")
         if not patient_id:
             raise AppError("Escolha um paciente.")
         if not items:
             raise AppError("Selecione pelo menos um atendimento para receber.")
+        current_rows = self.patient_payment_balance_appointments(
+            patient_id=patient_id, balance_filter="all", include_non_chargeable=True
+        )
+        current_by_id = {row["id"]: row for row in current_rows}
+        validated_items = []
+        for item in items:
+            row = current_by_id.get(item.get("appointment_id"))
+            open_amount = round(float((row or {}).get("_open_amount") or 0), 2)
+            if not row or open_amount <= 0:
+                raise AppError("Um atendimento selecionado não pertence ao paciente ou não possui saldo para receber.")
+            validated_items.append({"appointment_id": row["id"], "open_amount": open_amount})
         amount = self.parse_money(values.get("amount"), "valor recebido")
-        selected_total = sum(float(item.get("open_amount") or 0) for item in items)
+        selected_total = round(sum(item["open_amount"] for item in validated_items), 2)
         if amount > selected_total + 0.009:
-            raise AppError("O valor recebido nao pode ser maior que o saldo dos atendimentos selecionados.")
+            raise AppError("O valor recebido não pode ser maior que o saldo dos atendimentos selecionados.")
 
-        payment = {
-            "patient_id": patient_id,
-            "payment_date": values.get("payment_date"),
-            "amount": round(amount, 2),
-            "payment_method": values.get("payment_method") or "Nao informado",
-            "notes": values.get("notes", "").strip(),
-            "created_by": self.profile["id"],
-        }
-        created = self.client.table("patient_payments").insert(payment).execute().data[0]
-        remaining = amount
-        payment_items = []
-        for item in items:
-            if remaining <= 0:
-                break
-            item_amount = min(float(item.get("open_amount") or 0), remaining)
-            payment_items.append(
-                {
-                    "patient_payment_id": created["id"],
-                    "appointment_id": item["appointment_id"],
-                    "amount": round(item_amount, 2),
-                }
-            )
-            remaining -= item_amount
-        if payment_items:
-            self.client.table("patient_payment_items").insert(payment_items).execute()
-        for item in items:
-            appointment_id = item["appointment_id"]
-            financial = self.appointment_financials(appointment_id)
-            if not financial:
-                continue
-            rows = (
-                self.client.table("patient_payment_items")
-                .select("amount")
-                .eq("appointment_id", appointment_id)
-                .execute()
-                .data
-                or []
-            )
-            total_paid = sum(float(row.get("amount") or 0) for row in rows)
-            fee = float(financial.get("consultation_fee") or 0)
-            status = "Pago" if fee > 0 and total_paid >= fee - 0.009 else "Pendente"
-            self.client.table("appointment_financials").update(
-                {"payment_status": status, "payment_method": payment["payment_method"]}
-            ).eq("id", financial["id"]).execute()
+        self.client.rpc(
+            "register_patient_payment",
+            {
+                "p_patient_id": patient_id,
+                "p_payment_date": values.get("payment_date"),
+                "p_amount": round(amount, 2),
+                "p_payment_method": values.get("payment_method") or "Nao informado",
+                "p_notes": values.get("notes", "").strip(),
+                "p_appointment_ids": [item["appointment_id"] for item in validated_items],
+            },
+        ).execute()
 
     def professional_payouts(
         self,
-        start_date: date,
-        end_date: date,
+        start_date: date | None,
+        end_date: date | None,
         professional_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        query = (
-            self.client.table("professional_payouts")
-            .select("professional_id, amount")
-            .gte("payout_date", start_date.isoformat())
-            .lte("payout_date", end_date.isoformat())
-        )
+        query = self.client.table("professional_payouts").select("professional_id, amount")
+        if start_date:
+            query = query.gte("payout_date", start_date.isoformat())
+        if end_date:
+            query = query.lte("payout_date", end_date.isoformat())
         if professional_id:
             query = query.eq("professional_id", professional_id)
         return query.execute().data or []
 
+    def professional_payout_history(
+        self,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        patient_id: str | None = None,
+        professional_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = (
+            self.client.table("professional_payouts")
+            .select("*, professionals(full_name), professional_payout_items(amount, appointments(patient_id, professional_id))")
+            .order("payout_date", desc=True)
+            .order("created_at", desc=True)
+        )
+        if start_date:
+            query = query.gte("payout_date", start_date.isoformat())
+        if end_date:
+            query = query.lte("payout_date", end_date.isoformat())
+        if professional_id:
+            query = query.eq("professional_id", professional_id)
+        rows = query.execute().data or []
+        if patient_id:
+            rows = [
+                row for row in rows
+                if any(
+                    (item.get("appointments") or {}).get("patient_id") == patient_id
+                    for item in row.get("professional_payout_items") or []
+                )
+            ]
+        return rows
+
     def professional_payout_items_for_appointments(self, appointment_ids: list[str]) -> list[dict[str, Any]]:
         if not appointment_ids:
             return []
-        return (
-            self.client.table("professional_payout_items")
-            .select("appointment_id, amount")
-            .in_("appointment_id", appointment_ids)
-            .execute()
-            .data
-            or []
-        )
+        rows: list[dict[str, Any]] = []
+        for batch in self._batched_ids(appointment_ids):
+            rows.extend(
+                self.client.table("professional_payout_items")
+                .select("appointment_id, amount")
+                .in_("appointment_id", batch)
+                .execute()
+                .data
+                or []
+            )
+        return rows
 
     def professional_open_payout_appointments(self, professional_id: str) -> list[dict[str, Any]]:
         rows = (
             self.client.table("appointments")
             .select("*, patients(full_name), appointment_financials(*)")
             .eq("professional_id", professional_id)
-            .in_("status", ["Atendido", "Falta sem aviso"])
             .order("appointment_date")
             .order("start_time")
             .execute()
@@ -869,69 +1054,61 @@ class SupabaseRepository:
         appointment_ids = [row["id"] for row in rows]
         paid_by_appointment = {appointment_id: 0.0 for appointment_id in appointment_ids}
         if appointment_ids:
-            items = (
-                self.client.table("professional_payout_items")
-                .select("appointment_id, amount")
-                .in_("appointment_id", appointment_ids)
-                .execute()
-                .data
-                or []
-            )
-            for item in items:
+            for item in self.professional_payout_items_for_appointments(appointment_ids):
                 appointment_id = item.get("appointment_id")
                 paid_by_appointment[appointment_id] = paid_by_appointment.get(appointment_id, 0.0) + float(item.get("amount") or 0)
         open_rows = []
         for row in rows:
-            fee = float(self.financial_row(row).get("consultation_fee") or 0)
-            payout_amount = fee * 0.70
+            financial = self.financial_row(row)
+            chargeable = (
+                row.get("status") not in self.NON_CHARGEABLE_APPOINTMENT_STATUSES
+                and financial.get("payment_status") not in self.NON_CHARGEABLE_FINANCIAL_STATUSES
+            )
+            fee = round(float(financial.get("consultation_fee") or 0), 2)
+            payout_amount = round(fee * 0.70, 2) if chargeable else 0.0
             paid = paid_by_appointment.get(row["id"], 0.0)
-            open_amount = max(payout_amount - paid, 0)
-            if open_amount > 0:
-                row["_gross_amount"] = fee
-                row["_payout_amount"] = payout_amount
-                row["_paid_payout_amount"] = paid
-                row["_open_payout_amount"] = open_amount
-                open_rows.append(row)
+            open_amount = round(max(payout_amount - paid, 0), 2)
+            row["_gross_amount"] = fee if chargeable else 0.0
+            row["_payout_amount"] = payout_amount
+            row["_paid_payout_amount"] = round(paid, 2)
+            row["_open_payout_amount"] = open_amount
+            row["_is_chargeable"] = chargeable
+            open_rows.append(row)
         return open_rows
 
     def save_professional_payout(self, values: dict[str, Any], items: list[dict[str, Any]]) -> None:
         if self.profile is None:
-            raise AppError("Usuario sem perfil ativo.")
+            raise AppError("Usuário sem perfil ativo.")
         professional_id = values.get("professional_id")
         if not professional_id:
-            raise AppError("Escolha um funcionario.")
+            raise AppError("Escolha um funcionário.")
         if not items:
             raise AppError("Selecione pelo menos um atendimento para repassar.")
-        amount = self.parse_money(values.get("amount"), "valor do repasse")
-        selected_total = sum(float(item.get("open_amount") or 0) for item in items)
-        if amount > selected_total + 0.009:
-            raise AppError("O valor do repasse nao pode ser maior que o saldo dos atendimentos selecionados.")
-
-        payout = {
-            "professional_id": professional_id,
-            "payout_date": values.get("payout_date"),
-            "amount": round(amount, 2),
-            "payment_method": values.get("payment_method") or "Nao informado",
-            "notes": values.get("notes", "").strip(),
-            "created_by": self.profile["id"],
-        }
-        created = self.client.table("professional_payouts").insert(payout).execute().data[0]
-        remaining = amount
-        payout_items = []
+        current_rows = self.professional_open_payout_appointments(professional_id)
+        current_by_id = {row["id"]: row for row in current_rows}
+        validated_items = []
         for item in items:
-            if remaining <= 0:
-                break
-            item_amount = min(float(item.get("open_amount") or 0), remaining)
-            payout_items.append(
-                {
-                    "professional_payout_id": created["id"],
-                    "appointment_id": item["appointment_id"],
-                    "amount": round(item_amount, 2),
-                }
-            )
-            remaining -= item_amount
-        if payout_items:
-            self.client.table("professional_payout_items").insert(payout_items).execute()
+            row = current_by_id.get(item.get("appointment_id"))
+            open_amount = round(float((row or {}).get("_open_payout_amount") or 0), 2)
+            if not row or open_amount <= 0:
+                raise AppError("Um atendimento selecionado não pertence ao profissional ou não possui saldo para repassar.")
+            validated_items.append({"appointment_id": row["id"], "open_amount": open_amount})
+        amount = self.parse_money(values.get("amount"), "valor do repasse")
+        selected_total = round(sum(item["open_amount"] for item in validated_items), 2)
+        if amount > selected_total + 0.009:
+            raise AppError("O valor do repasse não pode ser maior que o saldo dos atendimentos selecionados.")
+
+        self.client.rpc(
+            "register_professional_payout",
+            {
+                "p_professional_id": professional_id,
+                "p_payout_date": values.get("payout_date"),
+                "p_amount": round(amount, 2),
+                "p_payment_method": values.get("payment_method") or "Nao informado",
+                "p_notes": values.get("notes", "").strip(),
+                "p_appointment_ids": [item["appointment_id"] for item in validated_items],
+            },
+        ).execute()
 
     def financial_row(self, appointment: dict[str, Any]) -> dict[str, Any]:
         financials = appointment.get("appointment_financials") or []
@@ -939,25 +1116,56 @@ class SupabaseRepository:
             return financials[0] if financials else {}
         return financials
 
+    def appointment_is_chargeable(self, appointment: dict[str, Any]) -> bool:
+        financial = self.financial_row(appointment)
+        return (
+            appointment.get("status") not in self.NON_CHARGEABLE_APPOINTMENT_STATUSES
+            and financial.get("payment_status") not in self.NON_CHARGEABLE_FINANCIAL_STATUSES
+            and float(financial.get("consultation_fee") or 0) > 0
+        )
+
+    def professional_share(self, consultation_fee: Any) -> float:
+        return round(float(consultation_fee or 0) * 0.70, 2)
+
     def save_appointment_financials(self, appointment_id: str, values: dict[str, Any]) -> None:
-        fee_text = str(values.get("consultation_fee", "")).replace("R$", "").replace(".", "").replace(",", ".").strip()
-        consultation_fee = None
-        if fee_text:
-            try:
-                consultation_fee = float(fee_text)
-            except ValueError as exc:
-                raise AppError("Informe um valor de consulta valido.") from exc
-            if consultation_fee < 0:
-                raise AppError("O valor da consulta nao pode ser negativo.")
+        consultation_fee = self.parse_consultation_fee(values.get("consultation_fee", ""))
         existing = self.appointment_financials(appointment_id)
+        if consultation_fee is not None:
+            payment_items = (
+                self.client.table("patient_payment_items")
+                .select("amount")
+                .eq("appointment_id", appointment_id)
+                .execute()
+                .data
+                or []
+            )
+            received = round(sum(float(item.get("amount") or 0) for item in payment_items), 2)
+            if received > consultation_fee + 0.009:
+                raise AppError(
+                    f"O valor não pode ser menor que o total já recebido (R$ {received:.2f})."
+                )
+            payout_items = (
+                self.client.table("professional_payout_items")
+                .select("amount")
+                .eq("appointment_id", appointment_id)
+                .execute()
+                .data
+                or []
+            )
+            paid_payout = round(sum(float(item.get("amount") or 0) for item in payout_items), 2)
+            payout_limit = round(consultation_fee * 0.70, 2)
+            if paid_payout > payout_limit + 0.009:
+                raise AppError(
+                    f"O valor não pode gerar repasse menor que o total já pago (R$ {paid_payout:.2f})."
+                )
         payload = {
             "appointment_id": appointment_id,
             "consultation_fee": consultation_fee,
             "payment_status": values.get("payment_status", existing.get("payment_status", "Nao informado") if existing else "Nao informado"),
-            "payment_method": values.get("payment_method", existing.get("payment_method", "") if existing else "").strip(),
+            "payment_method": (values.get("payment_method") or "").strip(),
         }
         if "financial_notes" in values:
-            payload["financial_notes"] = values.get("financial_notes", "").strip()
+            payload["financial_notes"] = (values.get("financial_notes") or "").strip()
         if existing:
             self.client.table("appointment_financials").update(payload).eq("id", existing["id"]).execute()
         else:
@@ -965,7 +1173,7 @@ class SupabaseRepository:
 
     def save_recurring_schedule(self, values: dict[str, Any]) -> int:
         if values["end_time"] <= values["start_time"]:
-            raise AppError("O horario final deve ser maior que o horario inicial.")
+            raise AppError("O horário final deve ser maior que o horário inicial.")
         if values["end_date"] < values["start_date"]:
             raise AppError("A data final deve ser maior ou igual a data inicial.")
         schedule_values = {key: value for key, value in values.items() if key != "consultation_fee"}

@@ -152,6 +152,34 @@ dist\ClinicaAgape\ClinicaAgape.exe
 
 A pasta `dist/` é artefato de build e não deve ser versionada.
 
+## Atualizações automáticas
+
+O executável consulta a versão mais recente publicada nos Releases do repositório
+`HerickCallegari/Agape`. Quando existe uma versão superior, o aplicativo oferece o
+download, valida o SHA-256 do instalador e inicia a atualização.
+
+Para preparar uma versão:
+
+1. Em **Settings > Secrets and variables > Actions**, configure uma única vez os
+   secrets `SUPABASE_URL` e `SUPABASE_ANON_KEY`. Nunca configure a service role.
+2. Altere `APP_VERSION` em `agape_app/version.py` usando o formato `X.Y.Z`.
+3. Faça commit de todas as alterações.
+4. Com a árvore de trabalho limpa, execute:
+
+```powershell
+.\publish.ps1 -Version 1.0.1
+```
+
+O script executa os testes e envia a tag. O workflow do GitHub Actions compila o
+aplicativo no Windows, gera `ClinicaAgape-Setup.exe`, calcula seu checksum e cria o
+GitHub Release automaticamente. Acompanhe a execução na aba **Actions** do GitHub.
+
+O primeiro instalador deve ser instalado manualmente em cada computador. A partir
+dele, as próximas versões são oferecidas pelo próprio aplicativo.
+
+Não reutilize uma tag já publicada e nunca inclua `SUPABASE_SERVICE_ROLE_KEY` no
+aplicativo ou nos arquivos da release.
+
 ## Segurança e Dados Sensíveis
 
 - O arquivo `.env` não deve ser enviado ao Git.

@@ -12,7 +12,7 @@ serve(async (req) => {
   }
 
   if (req.method !== "POST") {
-    return json({ error: "Metodo nao permitido." }, 405);
+    return json({ error: "Método não permitido." }, 405);
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
@@ -20,7 +20,7 @@ serve(async (req) => {
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
   if (!supabaseUrl || !anonKey || !serviceRoleKey) {
-    return json({ error: "Funcao sem configuracao do Supabase." }, 500);
+    return json({ error: "Função sem configuração do Supabase." }, 500);
   }
 
   const authHeader = req.headers.get("Authorization") ?? "";
@@ -31,7 +31,7 @@ serve(async (req) => {
 
   const { data: userData, error: userError } = await authClient.auth.getUser();
   if (userError || !userData.user) {
-    return json({ error: "Sessao invalida." }, 401);
+    return json({ error: "Sessão inválida." }, 401);
   }
 
   const { data: callerProfile, error: profileError } = await adminClient
@@ -41,7 +41,7 @@ serve(async (req) => {
     .single();
 
   if (profileError || !callerProfile?.is_active) {
-    return json({ error: "Perfil sem permissao." }, 403);
+    return json({ error: "Perfil sem permissão." }, 403);
   }
 
   if (!["admin", "reception"].includes(callerProfile.role)) {
@@ -53,7 +53,7 @@ serve(async (req) => {
   const password = String(body.password ?? "");
 
   if (!authUserId) {
-    return json({ error: "Usuario alvo nao informado." }, 400);
+    return json({ error: "Usuário alvo não informado." }, 400);
   }
 
   if (password.length < 6) {
@@ -62,7 +62,7 @@ serve(async (req) => {
 
   const { data: targetUser, error: getTargetError } = await adminClient.auth.admin.getUserById(authUserId);
   if (getTargetError || !targetUser.user) {
-    return json({ error: "Usuario alvo nao encontrado no Auth." }, 404);
+    return json({ error: "Usuário alvo não encontrado no Auth." }, 404);
   }
 
   const { data: updatedUser, error } = await adminClient.auth.admin.updateUserById(authUserId, { password });

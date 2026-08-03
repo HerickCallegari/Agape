@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
+import os
+import subprocess
 import sys
 from datetime import date, datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QDate, QTime, QTimer, Qt
+from PySide6.QtCore import QDate, QThread, QTime, QTimer, Qt, Signal
 from PySide6.QtCore import QSize
 from PySide6.QtGui import QColor, QIcon, QPixmap, QTextCharFormat, QBrush
 from PySide6.QtWidgets import (
@@ -45,6 +49,8 @@ from .config import load_settings
 from .permissions import Permission, ROLE_LABELS, can
 from .repository import AppError, SupabaseRepository
 from .theme import APP_STYLESHEET, COLORS, STATUS_COLORS
+from .updater import ReleaseInfo, download_installer, latest_release
+from .version import APP_VERSION
 
 STATUSES = ["Agendado", "Confirmado", "Atendido", "Falta com aviso", "Falta sem aviso", "Cancelado"]
 SPECIALTIES = [
@@ -62,7 +68,7 @@ DOCUMENT_FILE_FILTER = (
     "PDF (*.pdf);;"
     "Word (*.doc *.docx);;"
     "Planilhas (*.xls *.xlsx *.csv);;"
-    "Apresentacoes (*.ppt *.pptx);;"
+    "Apresentações (*.ppt *.pptx);;"
     "Imagens (*.png *.jpg *.jpeg *.webp *.gif *.bmp);;"
     "Arquivos compactados (*.zip *.rar *.7z);;"
     "Todos os arquivos (*.*)"
@@ -99,6 +105,34 @@ def configure_windows_taskbar_id() -> None:
         pass
 
 
+def configure_logger() -> logging.Logger:
+    logger = logging.getLogger("clinica_agape")
+    if logger.handlers:
+        return logger
+
+    base_dir = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    log_dir = base_dir / "ClinicaAgape" / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler: logging.Handler = RotatingFileHandler(
+            log_dir / "app.log",
+            maxBytes=1_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+    except Exception:
+        handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    return logger
+
+
+LOGGER = configure_logger()
+_LAST_ERROR_SIGNATURE = ""
+_LAST_ERROR_AT: datetime | None = None
+
+
 def apply_window_icon(window: QWidget) -> None:
     icon = app_icon()
     window.setWindowIcon(icon)
@@ -125,8 +159,133 @@ def apply_window_icon(window: QWidget) -> None:
         pass
 
 
+def log_exception(context: str, exc: Exception) -> None:
+    LOGGER.error(context, exc_info=(type(exc), exc, exc.__traceback__))
+
+
+def friendly_error_message(exc: Exception) -> str:
+    raw = str(exc)
+    if "JSON could not be generated" in raw or "Bad Request" in raw:
+        return (
+            "Não foi possível atualizar alguns dados agora. "
+            "O sistema continuara aberto; tente atualizar a tela em instantes."
+        )
+    return raw
+
+
 def show_error(parent: QWidget, exc: Exception) -> None:
-    QMessageBox.warning(parent, "Atencao", str(exc))
+    global _LAST_ERROR_SIGNATURE, _LAST_ERROR_AT
+
+    log_exception("Erro exibido ao usuário", exc)
+    message = friendly_error_message(exc)
+    signature = f"{type(exc).__name__}:{message}"
+    now = datetime.now()
+    if (
+        _LAST_ERROR_SIGNATURE == signature
+        and _LAST_ERROR_AT is not None
+        and (now - _LAST_ERROR_AT).total_seconds() < 4
+    ):
+        return
+    _LAST_ERROR_SIGNATURE = signature
+    _LAST_ERROR_AT = now
+    QMessageBox.warning(parent, "Atenção", message)
+
+
+def show_page_error(parent: QWidget, page: QWidget, exc: Exception, show_popup: bool) -> None:
+    context = f"Erro ao atualizar {page.__class__.__name__}"
+    if show_popup:
+        show_error(parent, exc)
+    else:
+        log_exception(context, exc)
+
+
+class UpdateCheckThread(QThread):
+    update_available = Signal(object)
+    check_failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            release = latest_release(APP_VERSION)
+            if release:
+                self.update_available.emit(release)
+        except Exception as exc:
+            self.check_failed.emit(str(exc))
+
+
+class UpdateDownloadThread(QThread):
+    download_ready = Signal(str)
+    download_failed = Signal(str)
+
+    def __init__(self, release: ReleaseInfo):
+        super().__init__()
+        self.release = release
+
+    def run(self) -> None:
+        try:
+            self.download_ready.emit(str(download_installer(self.release)))
+        except Exception as exc:
+            self.download_failed.emit(str(exc))
+
+
+def start_update_check(app: QApplication, parent: QWidget) -> None:
+    if not getattr(sys, "frozen", False):
+        return
+
+    app._update_threads = getattr(app, "_update_threads", [])
+    check_thread = UpdateCheckThread()
+    app._update_threads.append(check_thread)
+
+    def forget_thread(thread: QThread) -> None:
+        if thread in app._update_threads:
+            app._update_threads.remove(thread)
+        thread.deleteLater()
+
+    def offer_update(release: ReleaseInfo) -> None:
+        notes = release.notes.strip()
+        if len(notes) > 700:
+            notes = f"{notes[:700].rstrip()}…"
+        message = f"A versão {release.version} está disponível. Deseja atualizar agora?"
+        if notes:
+            message = f"{message}\n\n{notes}"
+        answer = QMessageBox.question(
+            parent,
+            "Atualização disponível",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        QMessageBox.information(
+            parent,
+            "Baixando atualização",
+            "A atualização será baixada em segundo plano. O aplicativo avisará quando estiver pronta.",
+        )
+        download_thread = UpdateDownloadThread(release)
+        app._update_threads.append(download_thread)
+
+        def install_update(installer_path: str) -> None:
+            try:
+                subprocess.Popen(
+                    [installer_path, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
+                    close_fds=True,
+                )
+                app.quit()
+            except Exception as exc:
+                show_error(parent, exc)
+
+        download_thread.download_ready.connect(install_update)
+        download_thread.download_failed.connect(
+            lambda message: QMessageBox.warning(parent, "Falha na atualização", message)
+        )
+        download_thread.finished.connect(lambda: forget_thread(download_thread))
+        download_thread.start()
+
+    check_thread.update_available.connect(offer_update)
+    check_thread.check_failed.connect(lambda message: LOGGER.info("Verificação de atualização ignorada: %s", message))
+    check_thread.finished.connect(lambda: forget_thread(check_thread))
+    check_thread.start()
 
 
 def clear_layout(layout) -> None:
@@ -211,7 +370,7 @@ class LoginWindow(QWidget):
         super().__init__()
         self.repo = repo
         self.main_window: MainWindow | None = None
-        self.setWindowTitle("Clinica Agape - Entrar")
+        self.setWindowTitle("Clínica Agape - Entrar")
         apply_window_icon(self)
         self.setMinimumSize(620, 600)
 
@@ -227,7 +386,7 @@ class LoginWindow(QWidget):
         if not pixmap.isNull():
             logo.setPixmap(pixmap.scaled(360, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         else:
-            logo.setText("Clinica Agape")
+            logo.setText("Clínica Agape")
             logo.setObjectName("Title")
 
         self.email = QLineEdit()
@@ -281,7 +440,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.repo = repo
         self.profile = profile
-        self.setWindowTitle("Clinica Agape")
+        self.setWindowTitle("Clínica Agape")
         apply_window_icon(self)
         self.setMinimumSize(1120, 720)
 
@@ -307,12 +466,43 @@ class MainWindow(QMainWindow):
         if not sidebar_logo.isNull():
             brand.setPixmap(sidebar_logo.scaled(210, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         else:
-            brand.setText("Clinica Agape")
+            brand.setText("Clínica Agape")
             brand.setStyleSheet("background: transparent; color: #FFFFFF; font-size: 22px; font-weight: 800;")
-        user = QLabel(f"{profile.get('full_name', '')}\n{ROLE_LABELS.get(profile.get('role'), profile.get('role'))}")
-        user.setObjectName("Muted")
+        profile_name = str(profile.get("full_name") or "Usuário")
+        profile_role = ROLE_LABELS.get(profile.get("role"), profile.get("role") or "Perfil")
+        initials = "".join(part[0] for part in profile_name.split()[:2] if part).upper() or "U"
+        profile_card = QFrame()
+        profile_card.setStyleSheet(
+            "QFrame { background: rgba(255, 255, 255, 0.12); border: 1px solid rgba(255, 255, 255, 0.24); "
+            "border-radius: 12px; }"
+        )
+        profile_layout = QHBoxLayout(profile_card)
+        profile_layout.setContentsMargins(12, 11, 12, 11)
+        profile_layout.setSpacing(10)
+        avatar = QLabel(initials)
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setFixedSize(42, 42)
+        avatar.setStyleSheet(
+            "background: #FFFFFF; color: #B51F68; border: none; border-radius: 21px; "
+            "font-size: 14px; font-weight: 900;"
+        )
+        profile_text = QVBoxLayout()
+        profile_text.setSpacing(3)
+        name_label = QLabel(profile_name)
+        name_label.setToolTip(profile_name)
+        name_label.setWordWrap(True)
+        name_label.setStyleSheet("background: transparent; border: none; color: #FFFFFF; font-size: 14px; font-weight: 800;")
+        role_label = QLabel(str(profile_role))
+        role_label.setStyleSheet(
+            "background: rgba(255, 255, 255, 0.16); border: none; border-radius: 6px; "
+            "color: #FFFFFF; padding: 3px 7px; font-size: 11px; font-weight: 700;"
+        )
+        profile_text.addWidget(name_label)
+        profile_text.addWidget(role_label, 0, Qt.AlignLeft)
+        profile_layout.addWidget(avatar, 0, Qt.AlignTop)
+        profile_layout.addLayout(profile_text, 1)
         side_layout.addWidget(brand)
-        side_layout.addWidget(user)
+        side_layout.addWidget(profile_card)
         side_layout.addSpacing(14)
 
         self.stack = QStackedWidget()
@@ -320,16 +510,16 @@ class MainWindow(QMainWindow):
         self.agenda_page = AgendaPage(repo, profile)
         self.dashboard_page = DashboardPage(repo, profile, self.show_page_by_label)
         self.pages: list[tuple[str, QWidget]] = [
-            ("Inicio", self.dashboard_page),
+            ("Início", self.dashboard_page),
             ("Agenda", self.agenda_page),
             ("Pacientes", PatientsPage(repo, profile)),
-            ("Exportar sessoes", SessionExportPage(repo)),
+            ("Exportar sessões", SessionExportPage(repo)),
             ("Documentos", DocumentsPage(repo, profile)),
         ]
         if can(profile, Permission.VIEW_FINANCIALS):
             self.pages.append(("Financeiro", FinancePage(repo)))
         if can(profile, Permission.VIEW_SETTINGS):
-            self.pages.append(("Configuracoes", SettingsPage(repo)))
+            self.pages.append(("Configurações", SettingsPage(repo)))
 
         for index, (label, page) in enumerate(self.pages):
             self.stack.addWidget(page)
@@ -372,7 +562,9 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(sidebar)
         root_layout.addWidget(self.stack, 1)
-        self.show_page(0)
+        self.stack.setCurrentIndex(0)
+        self.set_active_nav(0)
+        QTimer.singleShot(0, self.refresh_initial_page)
         self.auto_refresh_timer = QTimer(self)
         self.auto_refresh_timer.setInterval(10_000)
         self.auto_refresh_timer.timeout.connect(self.auto_refresh_current_page)
@@ -392,15 +584,28 @@ class MainWindow(QMainWindow):
         self.agenda_page.set_admin_mode(enabled)
         self.dashboard_page.set_admin_mode(enabled)
 
-    def show_page(self, index: int) -> None:
-        page = self.stack.widget(index)
-        if hasattr(page, "refresh"):
-            page.refresh()
-        self.stack.setCurrentIndex(index)
+    def set_active_nav(self, index: int) -> None:
         for idx, nav in enumerate(self.nav_buttons):
             nav.setProperty("active", idx == index)
             nav.style().unpolish(nav)
             nav.style().polish(nav)
+
+    def safe_refresh_page(self, page: QWidget, show_popup: bool = True) -> None:
+        if not hasattr(page, "refresh"):
+            return
+        try:
+            page.refresh()
+        except Exception as exc:
+            show_page_error(self, page, exc, show_popup)
+
+    def refresh_initial_page(self) -> None:
+        self.safe_refresh_page(self.stack.currentWidget(), show_popup=False)
+
+    def show_page(self, index: int) -> None:
+        page = self.stack.widget(index)
+        self.stack.setCurrentIndex(index)
+        self.set_active_nav(index)
+        self.safe_refresh_page(page, show_popup=True)
 
     def auto_refresh_current_page(self) -> None:
         if QApplication.activeModalWidget():
@@ -409,9 +614,9 @@ class MainWindow(QMainWindow):
         if not (0 <= index < len(self.pages)):
             return
         label, page = self.pages[index]
-        if label not in {"Inicio", "Agenda"} or not hasattr(page, "refresh"):
+        if label not in {"Início", "Agenda"} or not hasattr(page, "refresh"):
             return
-        page.refresh()
+        self.safe_refresh_page(page, show_popup=False)
 
 
 class DashboardPage(QWidget):
@@ -453,7 +658,6 @@ class DashboardPage(QWidget):
 
         layout.addWidget(stats_panel)
         layout.addWidget(today_card, 1)
-        self.refresh()
 
     def set_admin_mode(self, enabled: bool) -> None:
         if self.profile.get("role") != "admin":
@@ -539,8 +743,8 @@ class DashboardPage(QWidget):
         return frame
 
     def today_appointment_card(self, row: dict[str, Any]) -> QWidget:
-        patient = (row.get("patients") or {}).get("full_name", "Paciente nao informado")
-        professional = (row.get("professionals") or {}).get("full_name", "Profissional nao informado")
+        patient = (row.get("patients") or {}).get("full_name", "Paciente não informado")
+        professional = (row.get("professionals") or {}).get("full_name", "Profissional não informado")
         status_text = row.get("status", "")
         bg, fg = STATUS_COLORS.get(status_text, (COLORS["bg2"], COLORS["text"]))
         marker = fg if fg != COLORS["text"] else COLORS["primary"]
@@ -597,7 +801,7 @@ class PatientsPage(QWidget):
         layout.setSpacing(16)
         title = QLabel(title_text)
         title.setObjectName("PageTitle")
-        subtitle = QLabel("Pacientes registrados na clinica")
+        subtitle = QLabel("Pacientes registrados na clínica")
         subtitle.setObjectName("Muted")
 
         panel = page_card()
@@ -644,12 +848,13 @@ class PatientsPage(QWidget):
             """
         )
         self.active_only.stateChanged.connect(self.refresh)
+        can_manage_patients = can(self.profile, Permission.MANAGE_PATIENTS)
         self.new_btn = button("Novo paciente")
         self.new_btn.clicked.connect(self.create_record)
-        self.new_btn.setEnabled(can(self.profile, Permission.MANAGE_PATIENTS))
+        self.new_btn.setVisible(can_manage_patients)
         self.delete_btn = button("Excluir paciente", danger=True)
         self.delete_btn.clicked.connect(self.delete_record)
-        self.delete_btn.setEnabled(can(self.profile, Permission.MANAGE_PATIENTS))
+        self.delete_btn.setVisible(can_manage_patients)
         card_header.addWidget(self.card_title)
         card_header.addStretch()
         card_header.addWidget(self.search)
@@ -657,7 +862,7 @@ class PatientsPage(QWidget):
         card_header.addWidget(self.delete_btn)
         card_header.addWidget(self.new_btn)
         self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Nome", "Documento", "Responsavel", "Telefone", "Status", "Motivo"])
+        self.table.setHorizontalHeaderLabels(["Nome", "Documento", "Responsável", "Telefone", "Status", "Motivo"])
         full_row_table_polish(self.table)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -667,7 +872,6 @@ class PatientsPage(QWidget):
         panel_layout.addLayout(card_header)
         panel_layout.addWidget(self.table, 1)
         layout.addWidget(panel, 1)
-        self.refresh()
 
     def refresh(self) -> None:
         try:
@@ -699,6 +903,8 @@ class PatientsPage(QWidget):
         return self.rows[idx] if 0 <= idx < len(self.rows) else None
 
     def create_record(self) -> None:
+        if not can(self.profile, Permission.MANAGE_PATIENTS):
+            return
         dialog = PatientDialog(self, self.repo)
         if dialog.exec():
             try:
@@ -767,7 +973,7 @@ class PatientDialog(QDialog):
         title = QLabel(record.get("full_name", "Novo paciente") if record else "Novo paciente")
         title.setObjectName("PageTitle")
         title.setStyleSheet("font-size: 21px; background: transparent;")
-        subtitle = QLabel("Dados pessoais, residencia, motivo do atendimento e historico.")
+        subtitle = QLabel("Dados pessoais, residência, motivo do atendimento e histórico.")
         subtitle.setObjectName("Muted")
         subtitle.setStyleSheet("background: transparent;")
         header_layout.addWidget(title)
@@ -778,7 +984,7 @@ class PatientDialog(QDialog):
         address_tab = QWidget()
         history_tab = QWidget()
         tabs.addTab(personal_tab, "Dados pessoais")
-        tabs.addTab(address_tab, "Endereco")
+        tabs.addTab(address_tab, "Endereço")
         tabs.addTab(history_tab, "Atendimentos")
 
         personal_layout = QGridLayout(personal_tab)
@@ -794,7 +1000,7 @@ class PatientDialog(QDialog):
         self.birth_date.setPlaceholderText("AAAA-MM-DD")
         self.document = QLineEdit(record.get("document", "") if record else "")
         self.reason = QTextEdit(record.get("reason_for_care", "") if record else "")
-        self.reason.setPlaceholderText("Ex.: avaliacao inicial, acompanhamento terapeutico, dificuldade de fala...")
+        self.reason.setPlaceholderText("Ex.: avaliação inicial, acompanhamento terapêutico, dificuldade de fala...")
         self.notes = QTextEdit(record.get("general_notes", "") if record else "")
         self.reason.setMinimumHeight(120)
         self.notes.setMinimumHeight(120)
@@ -809,9 +1015,9 @@ class PatientDialog(QDialog):
         personal_layout.addWidget(self.birth_date, 1, 1)
         personal_layout.addWidget(QLabel("Documento"), 0, 2)
         personal_layout.addWidget(self.document, 1, 2)
-        personal_layout.addWidget(QLabel("Responsavel"), 2, 0)
+        personal_layout.addWidget(QLabel("Responsável"), 2, 0)
         personal_layout.addWidget(self.guardian, 3, 0)
-        personal_layout.addWidget(QLabel("Telefone responsavel"), 2, 1)
+        personal_layout.addWidget(QLabel("Telefone responsável"), 2, 1)
         personal_layout.addWidget(self.phone, 3, 1)
         personal_layout.addWidget(QLabel("Telefone paciente"), 2, 2)
         personal_layout.addWidget(self.patient_phone, 3, 2)
@@ -819,7 +1025,7 @@ class PatientDialog(QDialog):
         personal_layout.addWidget(self.email, 5, 0, 1, 3)
         personal_layout.addWidget(QLabel("Motivo do atendimento"), 6, 0, 1, 3)
         personal_layout.addWidget(self.reason, 7, 0, 1, 3)
-        personal_layout.addWidget(QLabel("Observacoes gerais"), 8, 0, 1, 3)
+        personal_layout.addWidget(QLabel("Observações gerais"), 8, 0, 1, 3)
         personal_layout.addWidget(self.notes, 9, 0, 1, 3)
 
         address_layout = QGridLayout(address_tab)
@@ -838,7 +1044,7 @@ class PatientDialog(QDialog):
         address_layout.addWidget(self.zip_code, 1, 0)
         address_layout.addWidget(QLabel("Rua"), 0, 1)
         address_layout.addWidget(self.street, 1, 1, 1, 2)
-        address_layout.addWidget(QLabel("Numero"), 2, 0)
+        address_layout.addWidget(QLabel("Número"), 2, 0)
         address_layout.addWidget(self.address_number, 3, 0)
         address_layout.addWidget(QLabel("Complemento"), 2, 1)
         address_layout.addWidget(self.address_complement, 3, 1, 1, 2)
@@ -855,7 +1061,7 @@ class PatientDialog(QDialog):
         self.history_summary = QLabel("")
         self.history_summary.setObjectName("Muted")
         self.history_table = QTableWidget(0, 5)
-        self.history_table.setHorizontalHeaderLabels(["Data", "Horario", "Profissional", "Status", "Situacao"])
+        self.history_table.setHorizontalHeaderLabels(["Data", "Horário", "Profissional", "Status", "Situação"])
         table_polish(self.history_table)
         history_layout.addWidget(self.history_summary)
         history_layout.addWidget(self.history_table)
@@ -900,7 +1106,7 @@ class PatientDialog(QDialog):
         try:
             rows = self.repo.patient_appointments(self.record["id"])
         except Exception as exc:
-            self.history_summary.setText(f"Nao foi possivel carregar os atendimentos: {exc}")
+            self.history_summary.setText(f"Não foi possível carregar os atendimentos: {exc}")
             rows = []
         completed = sum(1 for row in rows if row.get("status") == "Atendido")
         pending = sum(1 for row in rows if row.get("status") not in {"Atendido", "Cancelado"})
@@ -953,9 +1159,9 @@ class SessionExportPage(QWidget):
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(16)
 
-        title = QLabel("Exportar sessoes")
+        title = QLabel("Exportar sessões")
         title.setObjectName("PageTitle")
-        subtitle = QLabel("Reuna observacoes por paciente para pareceres e relatorios.")
+        subtitle = QLabel("Reúna observações por paciente para pareceres e relatórios.")
         subtitle.setObjectName("Muted")
 
         filters_panel = page_card()
@@ -972,10 +1178,10 @@ class SessionExportPage(QWidget):
         self.end_date.setCalendarPopup(True)
         self.end_date.setDisplayFormat("dd/MM/yyyy")
         self.end_date.setMinimumWidth(150)
-        load_btn = button("Carregar sessoes")
+        load_btn = button("Carregar sessões")
         load_btn.clicked.connect(self.load_sessions)
         filters.addLayout(self.filter_field("Paciente", self.patient))
-        filters.addLayout(self.filter_field("Inicio", self.start_date))
+        filters.addLayout(self.filter_field("Início", self.start_date))
         filters.addLayout(self.filter_field("Fim", self.end_date))
         filters.addStretch()
         filters.addWidget(load_btn, 0, Qt.AlignBottom)
@@ -987,15 +1193,15 @@ class SessionExportPage(QWidget):
         sessions_layout = QVBoxLayout(sessions_card)
         sessions_layout.setContentsMargins(18, 18, 18, 18)
         sessions_header = QHBoxLayout()
-        sessions_title = QLabel("Sessoes encontradas")
+        sessions_title = QLabel("Sessões encontradas")
         sessions_title.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-size: 17px; font-weight: 800;")
-        self.sessions_badge = QLabel("0 sessoes")
+        self.sessions_badge = QLabel("0 sessões")
         self.sessions_badge.setObjectName("Badge")
         sessions_header.addWidget(sessions_title)
         sessions_header.addStretch()
         sessions_header.addWidget(self.sessions_badge)
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Usar", "Data", "Horario", "Profissional", "Status"])
+        self.table.setHorizontalHeaderLabels(["Usar", "Data", "Horário", "Profissional", "Status"])
         table_polish(self.table)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -1006,10 +1212,10 @@ class SessionExportPage(QWidget):
         preview_card = page_card()
         preview_layout = QVBoxLayout(preview_card)
         preview_layout.setContentsMargins(18, 18, 18, 18)
-        preview_title = QLabel("Texto para relatorio")
+        preview_title = QLabel("Texto para relatório")
         preview_title.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-size: 17px; font-weight: 800;")
         self.preview = QTextEdit()
-        self.preview.setPlaceholderText("Selecione um paciente, carregue as sessoes e marque as observacoes que deseja exportar.")
+        self.preview.setPlaceholderText("Selecione um paciente, carregue as sessões e marque as observações que deseja exportar.")
         actions = QHBoxLayout()
         copy_btn = button("Copiar texto", secondary=True)
         copy_btn.clicked.connect(self.copy_text)
@@ -1056,7 +1262,7 @@ class SessionExportPage(QWidget):
     def load_sessions(self) -> None:
         patient_id = self.patient.currentData()
         if not patient_id:
-            show_error(self, AppError("Selecione um paciente antes de carregar as sessoes."))
+            show_error(self, AppError("Selecione um paciente antes de carregar as sessões."))
             return
         start = self.start_date.date().toPython()
         end = self.end_date.date().toPython()
@@ -1090,7 +1296,7 @@ class SessionExportPage(QWidget):
                 item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 self.table.setItem(row_index, col, item)
         self.table.blockSignals(False)
-        self.sessions_badge.setText(f"{len(self.rows)} sessoes")
+        self.sessions_badge.setText(f"{len(self.rows)} sessões")
         self.table.resizeColumnsToContents()
 
     def selected_rows(self) -> list[dict[str, Any]]:
@@ -1112,23 +1318,23 @@ class SessionExportPage(QWidget):
         rows = self.selected_rows()
         lines = [
             f"Paciente: {patient_name}",
-            f"Periodo: {self.start_date.date().toString('dd/MM/yyyy')} a {self.end_date.date().toString('dd/MM/yyyy')}",
+            f"Período: {self.start_date.date().toString('dd/MM/yyyy')} a {self.end_date.date().toString('dd/MM/yyyy')}",
             "",
-            "Sessoes selecionadas",
+            "Sessões selecionadas",
             "",
         ]
         if not rows:
-            lines.append("Nenhuma sessao selecionada.")
+            lines.append("Nenhuma sessão selecionada.")
             return "\n".join(lines)
         for row in rows:
-            professional = (row.get("professionals") or {}).get("full_name", "Nao informado")
-            note = self.session_note_text(row) or "Sem relatorio registrado."
+            professional = (row.get("professionals") or {}).get("full_name", "Não informado")
+            note = self.session_note_text(row) or "Sem relatório registrado."
             lines.extend(
                 [
-                    f"{self.format_date(row.get('appointment_date', ''))} - {str(row.get('start_time', ''))[:5]} as {str(row.get('end_time', ''))[:5]}",
+                    f"{self.format_date(row.get('appointment_date', ''))} - {str(row.get('start_time', ''))[:5]} às {str(row.get('end_time', ''))[:5]}",
                     f"Profissional: {professional}",
                     f"Status: {row.get('status', '')}",
-                    "Relatorio da sessao:",
+                    "Relatório da sessão:",
                     note,
                     "",
                 ]
@@ -1143,20 +1349,20 @@ class SessionExportPage(QWidget):
 
     def copy_text(self) -> None:
         QApplication.clipboard().setText(self.preview.toPlainText())
-        QMessageBox.information(self, "Exportar sessoes", "Texto copiado.")
+        QMessageBox.information(self, "Exportar sessões", "Texto copiado.")
 
     def save_txt(self) -> None:
         text = self.preview.toPlainText().strip()
         if not text:
-            show_error(self, AppError("Carregue as sessoes antes de salvar."))
+            show_error(self, AppError("Carregue as sessões antes de salvar."))
             return
-        filename = f"sessoes-{self.patient.currentText().replace(' ', '-').lower()}.txt"
-        path, _ = QFileDialog.getSaveFileName(self, "Salvar sessoes", filename, "Texto (*.txt)")
+        filename = f"sessões-{self.patient.currentText().replace(' ', '-').lower()}.txt"
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar sessões", filename, "Texto (*.txt)")
         if not path:
             return
         try:
             Path(path).write_text(text, encoding="utf-8")
-            QMessageBox.information(self, "Exportar sessoes", "Arquivo salvo com sucesso.")
+            QMessageBox.information(self, "Exportar sessões", "Arquivo salvo com sucesso.")
         except Exception as exc:
             show_error(self, exc)
 
@@ -1178,7 +1384,7 @@ class ProfessionalsPage(QWidget):
         layout.setSpacing(16)
         title = QLabel("Profissionais")
         title.setObjectName("PageTitle")
-        subtitle = QLabel("Profissionais vinculados a usuarios do tipo Profissional")
+        subtitle = QLabel("Profissionais vinculados a usuários do tipo Profissional")
         subtitle.setObjectName("Muted")
         panel = page_card()
         panel_layout = QVBoxLayout(panel)
@@ -1214,7 +1420,6 @@ class ProfessionalsPage(QWidget):
         panel_layout.addWidget(self.table, 1)
         panel_layout.addLayout(row_actions)
         layout.addWidget(panel, 1)
-        self.refresh()
 
     def refresh(self) -> None:
         try:
@@ -1287,7 +1492,7 @@ class ProfessionalDialog(QDialog):
         except Exception:
             pass
         if not self.profiles:
-            self.profile.addItem("Nenhum usuario profissional disponivel", None)
+            self.profile.addItem("Nenhum usuário profissional disponível", None)
         self.profile.currentIndexChanged.connect(self.sync_name_from_profile)
         if record and record.get("profile_id"):
             idx = self.profile.findData(record["profile_id"])
@@ -1302,7 +1507,7 @@ class ProfessionalDialog(QDialog):
         layout.addRow("Nome completo", self.name)
         layout.addRow("Especialidade", self.specialty)
         layout.addRow("Telefone", self.phone)
-        layout.addRow("Usuario", self.profile)
+        layout.addRow("Usuário", self.profile)
         layout.addRow("", self.active)
         layout.addRow("", save)
 
@@ -1314,7 +1519,7 @@ class ProfessionalDialog(QDialog):
 
     def values(self) -> dict[str, Any]:
         if not self.profile.currentData():
-            raise AppError("Crie primeiro um usuario com permissao Profissional em Configuracoes.")
+            raise AppError("Crie primeiro um usuário com permissão Profissional em Configurações.")
         return {
             "full_name": self.name.text().strip(),
             "specialty": self.specialty.currentText(),
@@ -1378,9 +1583,13 @@ class AgendaPage(QWidget):
         self.new_recurring = button("Nova agenda fixa", secondary=True)
         self.new_recurring.setMinimumHeight(40)
         self.new_recurring.clicked.connect(self.create_recurring)
+        self.bulk_edit = button("Alterar atendimentos", secondary=True)
+        self.bulk_edit.setMinimumHeight(40)
+        self.bulk_edit.clicked.connect(self.edit_appointments_bulk)
         allowed = can(profile, Permission.MANAGE_AGENDA)
         self.new_appointment.setEnabled(allowed)
         self.new_recurring.setEnabled(allowed)
+        self.bulk_edit.setVisible(allowed)
         self.day_stat_labels: dict[str, QLabel] = {}
         stats_panel = QFrame()
         style_card(stats_panel, COLORS["bg2"], COLORS["line"])
@@ -1443,6 +1652,7 @@ class AgendaPage(QWidget):
         canvas_header.addStretch()
         canvas_header.addWidget(self.new_appointment)
         canvas_header.addWidget(self.new_recurring)
+        canvas_header.addWidget(self.bulk_edit)
         self.list = QListWidget()
         self.list.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.list.setSpacing(8)
@@ -1462,9 +1672,8 @@ class AgendaPage(QWidget):
         top_grid.setColumnStretch(0, 1)
         top_grid.setColumnStretch(1, 2)
         layout.addLayout(top_grid, 1)
-        self.load_professionals()
+        self.professionals_loaded = False
         self.update_calendar_selection_style()
-        self.refresh()
 
     def sync_calendar_date(self) -> None:
         self.calendar.setDateTextFormat(self.selected_calendar_date, QTextCharFormat())
@@ -1490,6 +1699,7 @@ class AgendaPage(QWidget):
         if self.profile.get("role") != "admin":
             return
         self.admin_mode_enabled = enabled
+        self.professionals_loaded = False
         self.load_professionals()
         self.refresh()
 
@@ -1507,8 +1717,11 @@ class AgendaPage(QWidget):
         self.professional_filter.clear()
         try:
             self.professionals = self.repo.professionals(active_only=True)
-        except Exception:
+            self.professionals_loaded = True
+        except Exception as exc:
+            log_exception("Erro ao carregar profissionais da agenda", exc)
             self.professionals = []
+            self.professionals_loaded = False
         if self.can_view_all_agendas():
             self.professional_filter.addItem("Todos os profissionais", None)
             visible_professionals = self.professionals
@@ -1522,6 +1735,8 @@ class AgendaPage(QWidget):
         self.professional_filter.blockSignals(False)
 
     def refresh(self) -> None:
+        if not self.professionals_loaded:
+            self.load_professionals()
         selected = self.date_edit.date().toPython()
         professional_id = self.professional_filter.currentData()
         try:
@@ -1593,9 +1808,9 @@ class AgendaPage(QWidget):
             "border-radius: 8px; padding: 8px; font-size: 18px; font-weight: 800;"
         )
         details = QVBoxLayout()
-        patient_label = QLabel(patient or "Paciente nao informado")
+        patient_label = QLabel(patient or "Paciente não informado")
         patient_label.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-size: 16px; font-weight: 800;")
-        professional_label = QLabel(professional or "Profissional nao informado")
+        professional_label = QLabel(professional or "Profissional não informado")
         professional_label.setStyleSheet(f"background: transparent; color: {COLORS['muted']};")
         details.addWidget(patient_label)
         details.addWidget(professional_label)
@@ -1666,6 +1881,11 @@ class AgendaPage(QWidget):
             except Exception as exc:
                 show_error(self, exc)
 
+    def edit_appointments_bulk(self) -> None:
+        dialog = BulkAppointmentEditDialog(self, self.repo)
+        if dialog.exec():
+            self.refresh()
+
 
 class AppointmentDialog(QDialog):
     def __init__(self, parent: QWidget, repo: SupabaseRepository, selected_date: date):
@@ -1694,10 +1914,10 @@ class AppointmentDialog(QDialog):
         layout.addRow("Paciente", self.patient)
         layout.addRow("Profissional", self.professional)
         layout.addRow("Data", self.date_edit)
-        layout.addRow("Inicio", self.start)
+        layout.addRow("Início", self.start)
         layout.addRow("Fim", self.end)
         layout.addRow("Status", self.status)
-        layout.addRow("Valor da sessao", self.consultation_fee)
+        layout.addRow("Valor da sessão", self.consultation_fee)
         layout.addRow("", save)
 
     def values(self) -> dict[str, Any]:
@@ -1727,7 +1947,7 @@ class RecurringDialog(QDialog):
         for item in self.professionals:
             self.professional.addItem(item["full_name"], item["id"])
         self.weekday = QComboBox()
-        for idx, label in enumerate(["Segunda", "Terca", "Quarta", "Quinta", "Sexta", "Sabado", "Domingo"]):
+        for idx, label in enumerate(["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]):
             self.weekday.addItem(label, idx)
         self.start = time_field(8, 0)
         self.end = time_field(9, 0)
@@ -1743,9 +1963,9 @@ class RecurringDialog(QDialog):
         layout.addRow("Paciente", self.patient)
         layout.addRow("Profissional", self.professional)
         layout.addRow("Dia da semana", self.weekday)
-        layout.addRow("Inicio", self.start)
+        layout.addRow("Início", self.start)
         layout.addRow("Fim", self.end)
-        layout.addRow("Valor da sessao", self.consultation_fee)
+        layout.addRow("Valor da sessão", self.consultation_fee)
         layout.addRow("Data inicial", self.start_date)
         layout.addRow("Data final", self.end_date)
         layout.addRow("", save)
@@ -1762,6 +1982,302 @@ class RecurringDialog(QDialog):
             "consultation_fee": self.consultation_fee.text(),
             "is_active": True,
         }
+
+
+class BulkAppointmentEditDialog(QDialog):
+    def __init__(self, parent: QWidget, repo: SupabaseRepository):
+        super().__init__(parent)
+        self.repo = repo
+        self.rows: list[dict[str, Any]] = []
+        self.appointment_checks: list[QCheckBox] = []
+        self.updating_checks = False
+        self.setWindowTitle("Alterar atendimentos em lote")
+        self.setMinimumSize(980, 680)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 22)
+        layout.setSpacing(14)
+
+        title = QLabel("Selecionar atendimentos")
+        title.setObjectName("PageTitle")
+        hint = QLabel("Filtre, selecione uma ou mais linhas e escolha as alterações que deseja aplicar.")
+        hint.setObjectName("Muted")
+        layout.addWidget(title)
+        layout.addWidget(hint)
+
+        filters = QGridLayout()
+        today = QDate.currentDate()
+        self.start_date = QDateEdit(today.addMonths(-1))
+        self.end_date = QDateEdit(today.addMonths(1))
+        self.start_date.setCalendarPopup(True)
+        self.end_date.setCalendarPopup(True)
+        self.professional = QComboBox()
+        self.professional.addItem("Todos os profissionais", None)
+        for item in repo.professionals(active_only=False):
+            self.professional.addItem(item["full_name"], item["id"])
+        self.patient = QComboBox()
+        self.patient.addItem("Todos os pacientes", None)
+        for item in repo.patients(active_only=False):
+            self.patient.addItem(item["full_name"], item["id"])
+        search = button("Buscar", secondary=True)
+        search.clicked.connect(self.load_rows)
+        for column, (label, widget) in enumerate(
+            [("Data inicial", self.start_date), ("Data final", self.end_date),
+             ("Profissional", self.professional), ("Paciente", self.patient)]
+        ):
+            filters.addWidget(QLabel(label), 0, column)
+            filters.addWidget(widget, 1, column)
+        filters.addWidget(search, 1, 4)
+        layout.addLayout(filters)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Selecionar", "Data", "Horário", "Paciente", "Profissional", "Status", "Valor"])
+        table_polish(self.table)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.table.verticalHeader().setDefaultSectionSize(44)
+        self.table.setShowGrid(False)
+        self.table.setFocusPolicy(Qt.NoFocus)
+        check_icon = resource_path("check_white.svg").as_posix()
+        self.table.setStyleSheet(
+            self.table.styleSheet()
+            + f"""
+            QTableWidget::item {{ border: none; border-radius: 0px; padding: 0px; }}
+            QTableWidget::item:selected {{ background: {COLORS['primary_soft']}; color: {COLORS['text']}; }}
+            QCheckBox {{ background: transparent; spacing: 0px; }}
+            QCheckBox::indicator {{
+                width: 22px; height: 22px; border-radius: 5px;
+                border: 2px solid {COLORS['primary']}; background: #FFFFFF;
+            }}
+            QCheckBox::indicator:checked {{
+                background: {COLORS['primary']}; border: 2px solid {COLORS['primary']};
+                image: url("{check_icon}");
+            }}
+            """
+        )
+        layout.addWidget(self.table, 1)
+
+        selection_bar = QHBoxLayout()
+        self.result_label = QLabel("0 atendimento(s)")
+        self.result_label.setObjectName("Muted")
+        select_all = button("Selecionar todos", secondary=True)
+        select_all.clicked.connect(self.select_all)
+        clear_selection = button("Limpar seleção", secondary=True)
+        clear_selection.clicked.connect(self.clear_selection)
+        selection_bar.addWidget(self.result_label)
+        selection_bar.addStretch()
+        selection_bar.addWidget(select_all)
+        selection_bar.addWidget(clear_selection)
+        layout.addLayout(selection_bar)
+
+        changes = page_card()
+        changes_layout = QGridLayout(changes)
+        changes_layout.setContentsMargins(16, 14, 16, 14)
+        self.start_time = QLineEdit()
+        self.start_time.setInputMask("00:00;_")
+        self.start_time.setPlaceholderText("HH:MM")
+        self.start_time.setMinimumHeight(44)
+        self.end_time = QLineEdit()
+        self.end_time.setInputMask("00:00;_")
+        self.end_time.setPlaceholderText("HH:MM")
+        self.end_time.setMinimumHeight(44)
+        self.status = QComboBox()
+        self.status.addItem("Não alterar", None)
+        for status in STATUSES:
+            self.status.addItem(status, status)
+        self.fee = QLineEdit()
+        self.fee.setPlaceholderText("Ex.: 150,00")
+        time_box = QVBoxLayout()
+        time_fields = QHBoxLayout()
+        start_box = QVBoxLayout()
+        start_label = QLabel("Início")
+        start_label.setStyleSheet("background: transparent;")
+        start_box.addWidget(start_label)
+        start_box.addWidget(self.start_time)
+        end_box = QVBoxLayout()
+        end_label = QLabel("Fim")
+        end_label.setStyleSheet("background: transparent;")
+        end_box.addWidget(end_label)
+        end_box.addWidget(self.end_time)
+        time_fields.addLayout(start_box)
+        time_fields.addLayout(end_box)
+        time_title = QLabel("Alterar horário")
+        time_title.setStyleSheet("background: transparent;")
+        time_box.addWidget(time_title)
+        time_box.addLayout(time_fields)
+        changes_layout.addLayout(time_box, 0, 0, 2, 1)
+        status_title = QLabel("Alterar status")
+        status_title.setStyleSheet("background: transparent;")
+        changes_layout.addWidget(status_title, 0, 1)
+        changes_layout.addWidget(self.status, 1, 1)
+        fee_title = QLabel("Alterar valor")
+        fee_title.setStyleSheet("background: transparent;")
+        changes_layout.addWidget(fee_title, 0, 2)
+        changes_layout.addWidget(self.fee, 1, 2)
+        changes_layout.setColumnStretch(0, 2)
+        changes_layout.setColumnStretch(1, 1)
+        changes_layout.setColumnStretch(2, 2)
+        layout.addWidget(changes)
+
+        actions = QHBoxLayout()
+        cancel = button("Cancelar", secondary=True)
+        cancel.clicked.connect(self.reject)
+        apply_button = button("Aplicar alterações")
+        apply_button.clicked.connect(self.apply_changes)
+        actions.addStretch()
+        actions.addWidget(cancel)
+        actions.addWidget(apply_button)
+        layout.addLayout(actions)
+        self.load_rows()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self.fit_to_available_screen)
+
+    def fit_to_available_screen(self) -> None:
+        screen = self.screen() or QApplication.primaryScreen()
+        if not screen:
+            return
+        if self.isMaximized():
+            self.showNormal()
+        available = screen.availableGeometry()
+        horizontal_margin = max(18, int(available.width() * 0.015))
+        top_margin = 18
+        bottom_margin = 28
+        self.setGeometry(
+            available.left() + horizontal_margin,
+            available.top() + top_margin,
+            available.width() - (horizontal_margin * 2),
+            available.height() - top_margin - bottom_margin,
+        )
+
+    def load_rows(self) -> None:
+        if self.end_date.date() < self.start_date.date():
+            QMessageBox.warning(self, "Período inválido", "A data final deve ser maior ou igual à data inicial.")
+            return
+        try:
+            self.rows = self.repo.financial_appointments(
+                self.start_date.date().toPython(), self.end_date.date().toPython(),
+                patient_id=self.patient.currentData(), professional_id=self.professional.currentData(),
+            )
+        except Exception as exc:
+            show_error(self, exc)
+            return
+        self.updating_checks = True
+        self.appointment_checks = []
+        self.table.clearContents()
+        self.table.setRowCount(len(self.rows))
+        for index, row in enumerate(self.rows):
+            financial = self.repo.financial_row(row)
+            fee = financial.get("consultation_fee")
+            values = [
+                date.fromisoformat(row["appointment_date"]).strftime("%d/%m/%Y"),
+                f"{row['start_time'][:5]} - {row['end_time'][:5]}",
+                (row.get("patients") or {}).get("full_name", ""),
+                (row.get("professionals") or {}).get("full_name", ""),
+                row.get("status", ""),
+                "" if fee is None else f"R$ {float(fee):.2f}".replace(".", ","),
+            ]
+            check = QCheckBox()
+            check.setCursor(Qt.PointingHandCursor)
+            check.stateChanged.connect(self.update_selection)
+            holder = QWidget()
+            holder.setStyleSheet(f"background: {COLORS['surface']};")
+            holder_layout = QHBoxLayout(holder)
+            holder_layout.setContentsMargins(0, 0, 0, 0)
+            holder_layout.setAlignment(Qt.AlignCenter)
+            holder_layout.addWidget(check)
+            self.table.setCellWidget(index, 0, holder)
+            self.appointment_checks.append(check)
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setTextAlignment(Qt.AlignCenter if column != 3 and column != 4 else Qt.AlignLeft | Qt.AlignVCenter)
+                self.table.setItem(index, column, item)
+        widths = [90, 110, 130, 270, 250, 130, 110]
+        for column, width in enumerate(widths):
+            self.table.setColumnWidth(column, width)
+        self.updating_checks = False
+        self.update_selection()
+
+    def select_all(self) -> None:
+        self.updating_checks = True
+        for check in self.appointment_checks:
+            check.setChecked(True)
+        self.updating_checks = False
+        self.update_selection()
+
+    def clear_selection(self) -> None:
+        self.updating_checks = True
+        for check in self.appointment_checks:
+            check.setChecked(False)
+        self.updating_checks = False
+        self.update_selection()
+
+    def update_selection(self) -> None:
+        if self.updating_checks:
+            return
+        selected_count = 0
+        for row_index, check in enumerate(self.appointment_checks):
+            checked = check.isChecked()
+            selected_count += int(checked)
+            holder = self.table.cellWidget(row_index, 0)
+            if holder:
+                holder.setStyleSheet(f"background: {COLORS['primary_soft'] if checked else COLORS['surface']};")
+            for column in range(1, self.table.columnCount()):
+                item = self.table.item(row_index, column)
+                if item:
+                    item.setSelected(checked)
+        self.result_label.setText(
+            f"{len(self.rows)} atendimento(s) encontrado(s)  |  {selected_count} selecionado(s)"
+        )
+
+    def selected_appointments(self) -> list[dict[str, Any]]:
+        return [
+            row for index, row in enumerate(self.rows)
+            if index < len(self.appointment_checks) and self.appointment_checks[index].isChecked()
+        ]
+
+    def apply_changes(self) -> None:
+        selected = self.selected_appointments()
+        if not selected:
+            QMessageBox.warning(self, "Nenhuma seleção", "Selecione pelo menos um atendimento na tabela.")
+            return
+        start_digits = "".join(character for character in self.start_time.text() if character.isdigit())
+        end_digits = "".join(character for character in self.end_time.text() if character.isdigit())
+        if start_digits and len(start_digits) != 4 or end_digits and len(end_digits) != 4:
+            QMessageBox.warning(self, "Horário inválido", "Informe o horário completo no formato HH:MM.")
+            return
+        start_time = f"{start_digits[:2]}:{start_digits[2:]}" if start_digits else ""
+        end_time = f"{end_digits[:2]}:{end_digits[2:]}" if end_digits else ""
+        if bool(start_time) != bool(end_time):
+            QMessageBox.warning(self, "Horário incompleto", "Preencha os horários de início e fim ou deixe ambos vazios.")
+            return
+        if start_time and (
+            not QTime.fromString(start_time, "HH:mm").isValid()
+            or not QTime.fromString(end_time, "HH:mm").isValid()
+        ):
+            QMessageBox.warning(self, "Horário inválido", "Informe horários válidos no formato HH:MM.")
+            return
+        answer = QMessageBox.question(
+            self, "Confirmar alterações",
+            f"Aplicar as alterações em {len(selected)} atendimento(s)?\n\nPaciente e profissional não serão modificados.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            count = self.repo.update_appointments_bulk(
+                selected,
+                start_time=f"{start_time}:00" if start_time else None,
+                end_time=f"{end_time}:00" if end_time else None,
+                status=self.status.currentData(),
+                consultation_fee=self.fee.text().strip() or None,
+            )
+            QMessageBox.information(self, "Atendimentos alterados", f"{count} atendimento(s) atualizado(s).")
+            self.accept()
+        except Exception as exc:
+            show_error(self, exc)
 
 
 class AppointmentDetailsDialog(QDialog):
@@ -1784,13 +2300,13 @@ class AppointmentDetailsDialog(QDialog):
         style_card(header, COLORS["surface_warm"])
         header_layout = QGridLayout(header)
         header_layout.setContentsMargins(18, 16, 18, 16)
-        title = QLabel(patient or "Paciente nao informado")
+        title = QLabel(patient or "Paciente não informado")
         title.setObjectName("PageTitle")
         title.setStyleSheet("font-size: 21px; background: transparent;")
-        subtitle = QLabel(f"{appointment['appointment_date']} - {appointment['start_time'][:5]} as {appointment['end_time'][:5]}")
+        subtitle = QLabel(f"{appointment['appointment_date']} - {appointment['start_time'][:5]} às {appointment['end_time'][:5]}")
         subtitle.setObjectName("Muted")
         subtitle.setStyleSheet("background: transparent;")
-        professional_label = QLabel(f"Profissional: {professional or 'Nao informado'}")
+        professional_label = QLabel(f"Profissional: {professional or 'Não informado'}")
         professional_label.setStyleSheet("background: transparent; font-weight: 700;")
         header_layout.addWidget(title, 0, 0)
         header_layout.addWidget(subtitle, 1, 0)
@@ -1802,26 +2318,72 @@ class AppointmentDetailsDialog(QDialog):
         patient_layout.setContentsMargins(18, 16, 18, 16)
         patient_layout.setHorizontalSpacing(18)
         patient_layout.setVerticalSpacing(10)
-        guardian = patient_data.get("guardian_name") or "Nao informado"
-        phone = patient_data.get("guardian_phone") or "Nao informado"
-        reason = patient_data.get("reason_for_care") or "Motivo do atendimento ainda nao informado."
-        general_notes = patient_data.get("general_notes") or "Sem observacoes gerais."
-        patient_layout.addWidget(self.info_label("Responsavel", guardian), 0, 0)
+        guardian = patient_data.get("guardian_name") or "Não informado"
+        phone = patient_data.get("guardian_phone") or "Não informado"
+        reason = patient_data.get("reason_for_care") or "Motivo do atendimento ainda não informado."
+        general_notes = patient_data.get("general_notes") or "Sem observações gerais."
+        patient_layout.addWidget(self.info_label("Responsável", guardian), 0, 0)
         patient_layout.addWidget(self.info_label("Telefone", phone), 0, 1)
         patient_layout.addWidget(self.info_label("Motivo do atendimento", reason), 1, 0, 1, 2)
-        patient_layout.addWidget(self.info_label("Observacoes gerais", general_notes), 2, 0, 1, 2)
+        patient_layout.addWidget(self.info_label("Observações gerais", general_notes), 2, 0, 1, 2)
 
         self.status = QComboBox()
         self.status.addItems(STATUSES)
         self.status.setCurrentText(appointment["status"])
         self.status.setEnabled(can(profile, Permission.CHANGE_STATUS))
 
+        can_manage = can(profile, Permission.MANAGE_AGENDA)
+        appointment_date = date.fromisoformat(appointment["appointment_date"])
+        self.appointment_date = QDateEdit(QDate(appointment_date.year, appointment_date.month, appointment_date.day))
+        self.appointment_date.setCalendarPopup(True)
+        self.appointment_date.setEnabled(can_manage)
+        start_parts = [int(value) for value in appointment["start_time"][:5].split(":")]
+        end_parts = [int(value) for value in appointment["end_time"][:5].split(":")]
+        self.start_time = time_field(*start_parts)
+        self.end_time = time_field(*end_parts)
+        self.start_time.setEnabled(can_manage)
+        self.end_time.setEnabled(can_manage)
+        self.consultation_fee = QLineEdit()
+        self.consultation_fee.setPlaceholderText("Ex.: 150,00")
+        self.consultation_fee.setEnabled(can_manage)
+        try:
+            financial = repo.appointment_financials(appointment["id"]) or {}
+            fee = financial.get("consultation_fee")
+            if fee is not None:
+                self.consultation_fee.setText(f"{float(fee):.2f}".replace(".", ","))
+        except Exception:
+            pass
+
+        is_professional = profile.get("role") == "professional"
+        edit_panel = QWidget()
+        edit_panel_layout = QVBoxLayout(edit_panel)
+        edit_panel_layout.setContentsMargins(0, 0, 0, 0)
+        edit_panel_layout.setSpacing(14)
+        admin_fields = QWidget()
+        edit_grid = QGridLayout(admin_fields)
+        edit_grid.setContentsMargins(0, 0, 0, 0)
+        edit_grid.addWidget(QLabel("Data"), 0, 0)
+        edit_grid.addWidget(self.appointment_date, 1, 0)
+        edit_grid.addWidget(QLabel("Início"), 0, 1)
+        edit_grid.addWidget(self.start_time, 1, 1)
+        edit_grid.addWidget(QLabel("Fim"), 0, 2)
+        edit_grid.addWidget(self.end_time, 1, 2)
+        fee_label = QLabel("Valor da consulta")
+        fee_label.setVisible(can_manage)
+        self.consultation_fee.setVisible(can_manage)
+        edit_grid.addWidget(fee_label, 0, 3)
+        edit_grid.addWidget(self.consultation_fee, 1, 3)
+
         status_row = QHBoxLayout()
         status_row.addWidget(QLabel("Status"))
         status_row.addWidget(self.status, 1)
+        admin_fields.setVisible(not is_professional and can_manage)
+        edit_panel_layout.addWidget(admin_fields)
+        edit_panel_layout.addLayout(status_row)
+        edit_panel.setVisible(can_manage or can(profile, Permission.CHANGE_STATUS))
 
         self.note = QTextEdit()
-        self.note.setPlaceholderText("Relatorio da sessao")
+        self.note.setPlaceholderText("Relatório da sessão")
         self.note.setMinimumHeight(340)
         try:
             existing = repo.session_note_for(appointment["id"])
@@ -1830,27 +2392,33 @@ class AppointmentDetailsDialog(QDialog):
             pass
         self.note.setEnabled(can(profile, Permission.WRITE_SESSION_NOTE))
 
-        buttons = QHBoxLayout()
-        save_button = button("Salvar")
-        save_button.setMinimumWidth(150)
-        save_button.setEnabled(
-            can(profile, Permission.CHANGE_STATUS)
-            or can(profile, Permission.WRITE_SESSION_NOTE)
-        )
-        save_button.clicked.connect(self.save_all)
-        buttons.addWidget(save_button)
-        buttons.addStretch()
+        edit_buttons = QHBoxLayout()
+        if not is_professional and (can_manage or can(profile, Permission.CHANGE_STATUS)):
+            save_changes_button = button("Salvar alterações")
+            save_changes_button.setMinimumWidth(170)
+            save_changes_button.clicked.connect(self.save_appointment_changes)
+            edit_buttons.addWidget(save_changes_button)
+        edit_buttons.addStretch()
         if can(profile, Permission.MANAGE_AGENDA):
             delete_btn = button("Excluir atendimento", danger=True)
             delete_btn.clicked.connect(self.delete_appointment)
-            buttons.addWidget(delete_btn)
+            edit_buttons.addWidget(delete_btn)
+
+        note_buttons = QHBoxLayout()
+        if can(profile, Permission.WRITE_SESSION_NOTE):
+            save_note_button = button("Salvar status e relatório" if is_professional else "Salvar relatório")
+            save_note_button.setMinimumWidth(170)
+            save_note_button.clicked.connect(self.save_session_report)
+            note_buttons.addWidget(save_note_button)
+        note_buttons.addStretch()
 
         layout.addWidget(header)
         layout.addWidget(patient_card)
-        layout.addLayout(status_row)
-        layout.addWidget(QLabel("Relatorio da sessao"))
+        layout.addWidget(edit_panel)
+        layout.addLayout(edit_buttons)
+        layout.addWidget(QLabel("Relatório da sessão"))
         layout.addWidget(self.note, 1)
-        layout.addLayout(buttons)
+        layout.addLayout(note_buttons)
 
     def info_label(self, title: str, value: str) -> QLabel:
         label = QLabel(f"{title}\n{value}")
@@ -1858,13 +2426,42 @@ class AppointmentDetailsDialog(QDialog):
         label.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-weight: 600;")
         return label
 
-    def save_all(self) -> None:
+    def save_appointment_changes(self) -> None:
         try:
-            if can(self.profile, Permission.CHANGE_STATUS):
+            if can(self.profile, Permission.MANAGE_AGENDA):
+                self.repo.parse_consultation_fee(self.consultation_fee.text())
+                values = {
+                    "patient_id": self.appointment["patient_id"],
+                    "professional_id": self.appointment["professional_id"],
+                    "appointment_date": self.appointment_date.date().toPython().isoformat(),
+                    "start_time": self.start_time.time().toString("HH:mm:ss"),
+                    "end_time": self.end_time.time().toString("HH:mm:ss"),
+                    "status": self.status.currentText(),
+                }
+                self.repo.save_appointment(values, self.appointment["id"])
+                existing = self.repo.appointment_financials(self.appointment["id"]) or {}
+                self.repo.save_appointment_financials(
+                    self.appointment["id"],
+                    {
+                        "consultation_fee": self.consultation_fee.text(),
+                        "payment_status": existing.get("payment_status", "Pendente"),
+                        "payment_method": existing.get("payment_method", ""),
+                        "financial_notes": existing.get("financial_notes", ""),
+                    },
+                )
+            elif can(self.profile, Permission.CHANGE_STATUS):
                 self.repo.update_appointment_status(self.appointment["id"], self.status.currentText())
+            self.accept()
+        except Exception as exc:
+            show_error(self, exc)
 
-            if can(self.profile, Permission.WRITE_SESSION_NOTE):
-                self.repo.save_session_note(self.appointment, self.note.toPlainText().strip())
+    def save_session_report(self) -> None:
+        try:
+            if not can(self.profile, Permission.WRITE_SESSION_NOTE):
+                raise AppError("Você não possui permissão para salvar o relatório da sessão.")
+            if self.profile.get("role") == "professional" and can(self.profile, Permission.CHANGE_STATUS):
+                self.repo.update_appointment_status(self.appointment["id"], self.status.currentText())
+            self.repo.save_session_note(self.appointment, self.note.toPlainText().strip())
             self.accept()
         except Exception as exc:
             show_error(self, exc)
@@ -1876,7 +2473,7 @@ class AppointmentDetailsDialog(QDialog):
         answer = QMessageBox.question(
             self,
             "Excluir atendimento",
-            f"Deseja excluir o atendimento de {patient} em {date_text} as {start_text}?",
+            f"Deseja excluir o atendimento de {patient} em {date_text} às {start_text}?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1900,6 +2497,11 @@ class FinancePage(QWidget):
         self.patient_payment_item_rows: list[dict[str, Any]] = []
         self.professional_payout_rows: list[dict[str, Any]] = []
         self.professional_payout_item_rows: list[dict[str, Any]] = []
+        self.summary_rows: list[dict[str, Any]] = []
+        self.summary_payment_item_rows: list[dict[str, Any]] = []
+        self.summary_payout_item_rows: list[dict[str, Any]] = []
+        self.receipt_history_rows: list[dict[str, Any]] = []
+        self.payout_history_rows: list[dict[str, Any]] = []
         self.professionals: list[dict[str, Any]] = []
         self.patients: list[dict[str, Any]] = []
         self.updating_financial_table = False
@@ -1919,7 +2521,7 @@ class FinancePage(QWidget):
         today = QDate.currentDate()
         self.use_date_filter = QCheckBox("Usar período")
         self.use_date_filter.setCursor(Qt.PointingHandCursor)
-        self.use_date_filter.setText("Usar periodo")
+        self.use_date_filter.setText("Usar período")
         self.use_date_filter.setMinimumWidth(150)
         self.use_date_filter.setMinimumHeight(44)
         self.use_date_filter.setStyleSheet(
@@ -1950,7 +2552,7 @@ class FinancePage(QWidget):
             }}
             """
         )
-        self.use_date_filter.stateChanged.connect(self.sync_finance_filters)
+        self.use_date_filter.stateChanged.connect(lambda _state=0: self.sync_finance_filters())
         self.start_date = QDateEdit(QDate(today.year(), today.month(), 1))
         self.start_date.setCalendarPopup(True)
         self.start_date.setMinimumWidth(130)
@@ -2005,9 +2607,9 @@ class FinancePage(QWidget):
         refresh_btn.setMinimumWidth(100)
         refresh_btn.clicked.connect(self.refresh)
         filters.addWidget(self.use_date_filter, 0, Qt.AlignBottom)
-        filters.addLayout(self.filter_field("Inicio", self.start_date))
+        filters.addLayout(self.filter_field("Início", self.start_date))
         filters.addLayout(self.filter_field("Fim", self.end_date))
-        filters.addLayout(self.filter_field("Situacao", self.status_filter))
+        filters.addLayout(self.filter_field("Situação", self.status_filter))
         filters.addLayout(self.filter_field("Paciente", self.patient_filter))
         filters.addLayout(self.filter_field("Profissional", self.professional_filter))
         filters.addStretch()
@@ -2033,8 +2635,8 @@ class FinancePage(QWidget):
         full_row_table_polish(self.patient_summary_table)
         self.patient_summary_table.cellDoubleClicked.connect(self.open_patient_financial_tab)
         self.professional_summary_table, professional_summary_panel = self.summary_table_panel(
-            "A pagar por funcionario",
-            ["Funcionario", "Atend.", "Bruto", "Repasse 70%", "Pago", "Aberto"],
+            "A pagar por funcionário",
+            ["Funcionário", "Atend.", "Bruto", "Repasse 70%", "Pago", "Aberto"],
         )
         full_row_table_polish(self.professional_summary_table)
         self.professional_summary_table.cellDoubleClicked.connect(self.open_professional_financial_tab)
@@ -2068,8 +2670,8 @@ class FinancePage(QWidget):
         payouts_actions.addStretch()
         payouts_actions.addWidget(register_payout)
         self.payouts_table, payouts_panel = self.summary_table_panel(
-            "Repasses de funcionarios",
-            ["Funcionario", "Atendimentos", "Valor bruto", "Percentual", "Repassado", "A pagar"],
+            "Repasses de funcionários",
+            ["Funcionário", "Atendimentos", "Valor bruto", "Percentual", "Repassado", "A pagar"],
         )
         payouts_layout.addLayout(payouts_actions)
         payouts_layout.addWidget(payouts_panel, 1)
@@ -2092,7 +2694,7 @@ class FinancePage(QWidget):
         table_header.addStretch()
         table_header.addWidget(self.table_badge)
         self.table = QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels(["Data", "Horario", "Paciente", "Profissional", "Atendimento", "Valor (R$)", "Pagamento", "Forma"])
+        self.table.setHorizontalHeaderLabels(["Data", "Horário", "Paciente", "Profissional", "Atendimento", "Valor (R$)", "Pagamento", "Forma"])
         full_row_table_polish(self.table)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -2102,18 +2704,48 @@ class FinancePage(QWidget):
         table_layout.addWidget(self.table, 1)
         appointments_layout.addWidget(table_panel, 1)
 
+        history_tab = QWidget()
+        history_layout = QVBoxLayout(history_tab)
+        history_layout.setContentsMargins(0, 14, 0, 0)
+        history_layout.setSpacing(12)
+        history_hint = QLabel("Movimentações registradas conforme os filtros financeiros selecionados.")
+        history_hint.setObjectName("Muted")
+        history_hint.setStyleSheet("background: transparent;")
+        history_sections = QTabWidget()
+        receipt_history_page = QWidget()
+        receipt_history_layout = QVBoxLayout(receipt_history_page)
+        receipt_history_layout.setContentsMargins(0, 10, 0, 0)
+        self.receipt_history_table, receipt_history_panel = self.summary_table_panel(
+            "Histórico de recebimentos",
+            ["Data", "Paciente", "Valor", "Forma", "Atendimentos", "Observação"],
+        )
+        full_row_table_polish(self.receipt_history_table)
+        receipt_history_layout.addWidget(receipt_history_panel, 1)
+        payout_history_page = QWidget()
+        payout_history_layout = QVBoxLayout(payout_history_page)
+        payout_history_layout.setContentsMargins(0, 10, 0, 0)
+        self.payout_history_table, payout_history_panel = self.summary_table_panel(
+            "Histórico de repasses",
+            ["Data", "Funcionário", "Valor", "Forma", "Atendimentos", "Observação"],
+        )
+        full_row_table_polish(self.payout_history_table)
+        payout_history_layout.addWidget(payout_history_panel, 1)
+        history_sections.addTab(receipt_history_page, "Recebimentos")
+        history_sections.addTab(payout_history_page, "Repasses")
+        history_layout.addWidget(history_hint)
+        history_layout.addWidget(history_sections, 1)
+
         self.tabs.addTab(summary_tab, "Resumo")
         self.tabs.addTab(receipts_tab, "Recebimentos")
         self.tabs.addTab(payouts_tab, "Repasses")
         self.tabs.addTab(appointments_tab, "Atendimentos")
+        self.tabs.addTab(history_tab, "Histórico")
 
         layout.addWidget(title)
         layout.addWidget(filters_panel)
         layout.addWidget(self.tabs, 1)
-        self.load_patients()
-        self.load_professionals()
-        self.sync_finance_filters()
-        self.refresh()
+        self.lookups_loaded = False
+        self.sync_finance_filters(refresh=False)
 
     def summary_table_panel(self, title: str, headers: list[str]) -> tuple[QTableWidget, QFrame]:
         panel = page_card()
@@ -2132,24 +2764,24 @@ class FinancePage(QWidget):
         return table, panel
 
     def register_receipt(self) -> None:
-        dialog = PatientReceiptDialog(self, self.repo, self.money)
-        if dialog.exec():
-            try:
+        try:
+            dialog = PatientReceiptDialog(self, self.repo, self.money)
+            if dialog.exec():
                 self.repo.save_patient_payment(dialog.values(), dialog.selected_items())
                 QMessageBox.information(self, "Recebimento", "Recebimento registrado com sucesso.")
                 self.refresh()
-            except Exception as exc:
-                show_error(self, exc)
+        except Exception as exc:
+            show_error(self, exc)
 
     def register_payout(self) -> None:
-        dialog = ProfessionalPayoutDialog(self, self.repo, self.money)
-        if dialog.exec():
-            try:
+        try:
+            dialog = ProfessionalPayoutDialog(self, self.repo, self.money)
+            if dialog.exec():
                 self.repo.save_professional_payout(dialog.values(), dialog.selected_items())
                 QMessageBox.information(self, "Repasse", "Repasse registrado com sucesso.")
                 self.refresh()
-            except Exception as exc:
-                show_error(self, exc)
+        except Exception as exc:
+            show_error(self, exc)
 
     def edit_financial_appointment(self, row: int, _col: int) -> None:
         if not (0 <= row < len(self.appointment_rows)):
@@ -2212,7 +2844,7 @@ class FinancePage(QWidget):
 
         table = QTableWidget(0, 9)
         table.setHorizontalHeaderLabels(
-            ["Data", "Horario", "Profissional", "Atendimento", "Valor", "Recebido", "Aberto", "Pagamento", "Forma"]
+            ["Data", "Horário", "Profissional", "Atendimento", "Valor", "Recebido", "Aberto", "Pagamento", "Forma"]
         )
         full_row_table_polish(table)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -2284,13 +2916,13 @@ class FinancePage(QWidget):
             financial = self.repo.financial_row(row)
             values = [
                 row.get("appointment_date", ""),
-                f"{row.get('start_time', '')[:5]} as {row.get('end_time', '')[:5]}",
+                f"{row.get('start_time', '')[:5]} às {row.get('end_time', '')[:5]}",
                 self.professional_name_for(row),
                 row.get("status", ""),
                 self.money_edit_text(financial.get("consultation_fee")),
                 self.money(row.get("_paid_amount", 0)),
                 self.money(row.get("_open_amount", 0)),
-                financial.get("payment_status") or "Nao informado",
+                self.payment_status_text(financial.get("payment_status")),
                 financial.get("payment_method") or "",
             ]
             for col, value in enumerate(values):
@@ -2319,7 +2951,7 @@ class FinancePage(QWidget):
         tab = self.build_professional_financial_tab(professional_id, professional_name)
         self.professional_financial_tabs[professional_id] = tab
         title = professional_name if len(professional_name) <= 18 else f"{professional_name[:17]}..."
-        index = self.tabs.addTab(tab, f"Funcionario: {title}")
+        index = self.tabs.addTab(tab, f"Funcionário: {title}")
         self.tabs.setCurrentIndex(index)
 
     def build_professional_financial_tab(self, professional_id: str, professional_name: str) -> QWidget:
@@ -2334,7 +2966,7 @@ class FinancePage(QWidget):
         text_box = QVBoxLayout()
         title = QLabel(professional_name)
         title.setObjectName("SectionTitle")
-        subtitle = QLabel("Atendimentos e repasses financeiros deste funcionario.")
+        subtitle = QLabel("Atendimentos e repasses financeiros deste funcionário.")
         subtitle.setObjectName("Muted")
         subtitle.setStyleSheet("background: transparent;")
         text_box.addWidget(title)
@@ -2348,7 +2980,7 @@ class FinancePage(QWidget):
 
         table = QTableWidget(0, 9)
         table.setHorizontalHeaderLabels(
-            ["Data", "Horario", "Paciente", "Atendimento", "Bruto", "Repasse 70%", "Pago", "Aberto", "Pagamento"]
+            ["Data", "Horário", "Paciente", "Atendimento", "Bruto", "Repasse 70%", "Pago", "Aberto", "Pagamento"]
         )
         full_row_table_polish(table)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -2358,7 +2990,7 @@ class FinancePage(QWidget):
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(18, 18, 18, 18)
         top = QHBoxLayout()
-        section = QLabel("Atendimentos do funcionario")
+        section = QLabel("Atendimentos do funcionário")
         section.setObjectName("SectionTitle")
         badge = QLabel("0 atendimentos")
         badge.setObjectName("Badge")
@@ -2424,20 +3056,20 @@ class FinancePage(QWidget):
         table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             financial = self.repo.financial_row(row)
-            gross = self.fee_for(row) if self.is_realized(row) else 0.0
+            gross = self.fee_for(row) if self.is_billable(row) else 0.0
             payout = gross * 0.70
             paid = paid_by_appointment.get(row.get("id"), 0.0)
             open_amount = max(payout - paid, 0.0)
             values = [
                 row.get("appointment_date", ""),
-                f"{row.get('start_time', '')[:5]} as {row.get('end_time', '')[:5]}",
+                f"{row.get('start_time', '')[:5]} às {row.get('end_time', '')[:5]}",
                 self.patient_name_for(row),
                 row.get("status", ""),
                 self.money(gross),
                 self.money(payout),
                 self.money(paid),
                 self.money(open_amount),
-                financial.get("payment_status") or "Nao informado",
+                self.payment_status_text(financial.get("payment_status")),
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -2461,24 +3093,37 @@ class FinancePage(QWidget):
             self.professionals = self.repo.professionals(active_only=True)
         except Exception:
             self.professionals = []
+        self.professional_filter.blockSignals(True)
+        self.professional_filter.clear()
+        self.professional_filter.addItem("Todos os profissionais", None)
         for professional in self.professionals:
             self.professional_filter.addItem(professional.get("full_name", ""), professional.get("id"))
+        self.professional_filter.blockSignals(False)
 
     def load_patients(self) -> None:
         try:
             self.patients = self.repo.patients(active_only=False)
         except Exception:
             self.patients = []
+        self.patient_filter.blockSignals(True)
+        self.patient_filter.clear()
+        self.patient_filter.addItem("Todos os pacientes", None)
         for patient in self.patients:
             self.patient_filter.addItem(patient.get("full_name", ""), patient.get("id"))
+        self.patient_filter.blockSignals(False)
 
-    def sync_finance_filters(self) -> None:
+    def sync_finance_filters(self, refresh: bool = True) -> None:
         use_period = self.use_date_filter.isChecked()
         self.start_date.setEnabled(use_period)
         self.end_date.setEnabled(use_period)
-        self.refresh()
+        if refresh:
+            self.refresh()
 
     def refresh(self) -> None:
+        if not self.lookups_loaded:
+            self.load_patients()
+            self.load_professionals()
+            self.lookups_loaded = True
         try:
             use_period = self.use_date_filter.isChecked()
             start = self.start_date.date().toPython() if use_period else None
@@ -2492,16 +3137,8 @@ class FinancePage(QWidget):
                 end_date=end,
                 balance_filter=self.status_filter.currentData() or "open",
             )
-            if start and end:
-                self.patient_payment_rows = self.repo.patient_payments(start, end)
-                self.professional_payout_rows = self.repo.professional_payouts(
-                    start,
-                    end,
-                    professional_id,
-                )
-            else:
-                self.patient_payment_rows = []
-                self.professional_payout_rows = []
+            self.patient_payment_rows = self.repo.patient_payments(start, end)
+            self.professional_payout_rows = self.repo.professional_payouts(start, end, professional_id)
             appointment_ids = [row.get("id") for row in self.rows if row.get("id")]
             self.patient_payment_item_rows = self.repo.patient_payment_items_for_appointments(appointment_ids)
             self.professional_payout_item_rows = self.repo.professional_payout_items_for_appointments(appointment_ids)
@@ -2521,6 +3158,22 @@ class FinancePage(QWidget):
             appointment_payment_items = self.repo.patient_payment_items_for_appointments(
                 [row.get("id") for row in appointment_rows if row.get("id")]
             )
+            self.summary_rows = appointment_rows
+            self.summary_payment_item_rows = appointment_payment_items
+            self.summary_payout_item_rows = self.repo.professional_payout_items_for_appointments(
+                [row.get("id") for row in appointment_rows if row.get("id")]
+            )
+            try:
+                self.receipt_history_rows = self.repo.patient_payment_history(
+                    start, end, patient_id, professional_id
+                )
+                self.payout_history_rows = self.repo.professional_payout_history(
+                    start, end, patient_id, professional_id
+                )
+            except Exception as history_exc:
+                log_exception("Erro ao carregar histórico financeiro", history_exc)
+                self.receipt_history_rows = []
+                self.payout_history_rows = []
             self.appointment_rows = self.filter_appointment_rows_by_situation(
                 appointment_rows,
                 appointment_payment_items,
@@ -2535,8 +3188,63 @@ class FinancePage(QWidget):
             self.patient_payment_item_rows = []
             self.professional_payout_rows = []
             self.professional_payout_item_rows = []
+            self.summary_rows = []
+            self.summary_payment_item_rows = []
+            self.summary_payout_item_rows = []
+            self.receipt_history_rows = []
+            self.payout_history_rows = []
         self.fill_summary()
         self.fill_table()
+        self.fill_financial_history()
+
+    def fill_financial_history(self) -> None:
+        self.receipt_history_table.setRowCount(len(self.receipt_history_rows))
+        for row_index, row in enumerate(self.receipt_history_rows):
+            items = row.get("patient_payment_items") or []
+            raw_date = str(row.get("payment_date") or "")
+            try:
+                date_text = date.fromisoformat(raw_date[:10]).strftime("%d/%m/%Y")
+            except ValueError:
+                date_text = raw_date
+            values = [
+                date_text,
+                (row.get("patients") or {}).get("full_name", "Paciente não informado"),
+                self.money(row.get("amount")),
+                row.get("payment_method") or "Não informado",
+                str(len(items)),
+                row.get("notes") or "",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setTextAlignment(Qt.AlignCenter if column != 1 and column != 5 else Qt.AlignLeft | Qt.AlignVCenter)
+                self.receipt_history_table.setItem(row_index, column, item)
+        self.receipt_history_table.resizeColumnsToContents()
+        self.receipt_history_table.horizontalHeader().setStretchLastSection(True)
+
+        self.payout_history_table.setRowCount(len(self.payout_history_rows))
+        for row_index, row in enumerate(self.payout_history_rows):
+            items = row.get("professional_payout_items") or []
+            raw_date = str(row.get("payout_date") or "")
+            try:
+                date_text = date.fromisoformat(raw_date[:10]).strftime("%d/%m/%Y")
+            except ValueError:
+                date_text = raw_date
+            values = [
+                date_text,
+                (row.get("professionals") or {}).get("full_name", "Funcionário não informado"),
+                self.money(row.get("amount")),
+                row.get("payment_method") or "Não informado",
+                str(len(items)),
+                row.get("notes") or "",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setTextAlignment(Qt.AlignCenter if column != 1 and column != 5 else Qt.AlignLeft | Qt.AlignVCenter)
+                self.payout_history_table.setItem(row_index, column, item)
+        self.payout_history_table.resizeColumnsToContents()
+        self.payout_history_table.horizontalHeader().setStretchLastSection(True)
 
     def money(self, value: Any) -> str:
         if value in (None, ""):
@@ -2566,6 +3274,9 @@ class FinancePage(QWidget):
             return "Pendente"
         return financial.get("payment_status") or "Pendente"
 
+    def payment_status_text(self, status: Any) -> str:
+        return "Não informado" if not status or status == "Nao informado" else str(status)
+
     def filter_appointment_rows_by_situation(
         self,
         rows: list[dict[str, Any]],
@@ -2591,8 +3302,8 @@ class FinancePage(QWidget):
                 filtered.append(row)
                 continue
 
-            is_closed = fee > 0 and open_amount <= 0.009
-            is_open = self.is_realized(row) and fee > 0 and open_amount > 0.009
+            is_closed = self.is_billable(row) and open_amount <= 0.009
+            is_open = self.is_billable(row) and open_amount > 0.009
             if situation == "open" and is_open:
                 filtered.append(row)
             elif situation == "closed" and is_closed:
@@ -2605,11 +3316,14 @@ class FinancePage(QWidget):
     def is_future(self, row: dict[str, Any]) -> bool:
         return row.get("status") in {"Agendado", "Confirmado"}
 
+    def is_billable(self, row: dict[str, Any]) -> bool:
+        return self.repo.appointment_is_chargeable(row)
+
     def patient_name_for(self, row: dict[str, Any]) -> str:
-        return (row.get("patients") or {}).get("full_name", "Paciente nao informado")
+        return (row.get("patients") or {}).get("full_name", "Paciente não informado")
 
     def professional_name_for(self, row: dict[str, Any]) -> str:
-        return (row.get("professionals") or {}).get("full_name", "Funcionario nao informado")
+        return (row.get("professionals") or {}).get("full_name", "Funcionário não informado")
 
     def payment_totals_by_appointment(self) -> dict[str, float]:
         totals: dict[str, float] = {}
@@ -2625,7 +3339,7 @@ class FinancePage(QWidget):
         rows_by_id = {row.get("id"): row for row in self.rows if row.get("id")}
         for row in self.patient_payment_item_rows:
             appointment = rows_by_id.get(row.get("appointment_id"))
-            if not appointment or not self.is_realized(appointment):
+            if not appointment or not self.is_billable(appointment):
                 continue
             patient_id = appointment.get("patient_id")
             if not patient_id:
@@ -2647,7 +3361,7 @@ class FinancePage(QWidget):
         rows_by_id = {row.get("id"): row for row in self.rows if row.get("id")}
         for row in self.professional_payout_item_rows:
             appointment = rows_by_id.get(row.get("appointment_id"))
-            if not appointment or not self.is_realized(appointment):
+            if not appointment or not self.is_billable(appointment):
                 continue
             professional_id = appointment.get("professional_id")
             if not professional_id:
@@ -2675,23 +3389,33 @@ class FinancePage(QWidget):
 
     def fill_summary(self) -> None:
         clear_layout(self.summary_grid)
-        realized = sum(self.fee_for(row) for row in self.rows if self.is_realized(row))
-        future = sum(self.fee_for(row) for row in self.rows if self.is_future(row))
-        received = sum(self.payment_totals_by_appointment().values())
-        patient_open = max(realized - received, 0)
-        professional_total = realized * 0.70
-        professional_paid = sum(self.payout_totals_by_appointment().values())
-        professional_due = max(professional_total - professional_paid, 0)
-        clinic_share = realized * 0.30
-        cash_result = received - professional_paid
+        billable_rows = [row for row in self.summary_rows if self.is_billable(row)]
+        billable_ids = {row.get("id") for row in billable_rows}
+        realized = round(sum(self.fee_for(row) for row in billable_rows), 2)
+        future = round(sum(self.fee_for(row) for row in billable_rows if self.is_future(row)), 2)
+        received_for_appointments = round(
+            sum(float(item.get("amount") or 0) for item in self.summary_payment_item_rows if item.get("appointment_id") in billable_ids),
+            2,
+        )
+        patient_open = round(max(realized - received_for_appointments, 0), 2)
+        professional_total = round(sum(self.repo.professional_share(self.fee_for(row)) for row in billable_rows), 2)
+        paid_for_appointments = round(
+            sum(float(item.get("amount") or 0) for item in self.summary_payout_item_rows if item.get("appointment_id") in billable_ids),
+            2,
+        )
+        professional_due = round(max(professional_total - paid_for_appointments, 0), 2)
+        clinic_share = round(sum(round(self.fee_for(row) * 0.30, 2) for row in billable_rows), 2)
+        received_cash = round(sum(float(row.get("amount") or 0) for row in self.patient_payment_rows), 2)
+        paid_cash = round(sum(float(row.get("amount") or 0) for row in self.professional_payout_rows), 2)
+        cash_result = round(received_cash - paid_cash, 2)
         cards = [
-            ("Faturado realizado", self.money(realized), COLORS["primary"]),
+            ("Faturado", self.money(realized), COLORS["primary"]),
             ("Faturamento futuro", self.money(future), COLORS["blue"]),
-            ("Recebido de pacientes", self.money(received), COLORS["green"]),
+            ("Recebido de pacientes", self.money(received_cash), COLORS["green"]),
             ("A receber", self.money(patient_open), COLORS["red"]),
-            ("A pagar funcionarios", self.money(professional_due), COLORS["primary_dark"]),
-            ("Repasses pagos", self.money(professional_paid), COLORS["blue"]),
-            ("Parte da clinica 30%", self.money(clinic_share), COLORS["text"]),
+            ("A pagar funcionários", self.money(professional_due), COLORS["primary_dark"]),
+            ("Repasses pagos", self.money(paid_cash), COLORS["blue"]),
+            ("Parte da clínica 30%", self.money(clinic_share), COLORS["text"]),
             ("Resultado em caixa", self.money(cash_result), COLORS["green"] if cash_result >= 0 else COLORS["red"]),
         ]
         for col, (label, value, color) in enumerate(cards):
@@ -2743,7 +3467,7 @@ class FinancePage(QWidget):
         grouped: dict[str, dict[str, Any]] = {}
         payments = self.payment_totals_by_patient()
         for row in self.rows:
-            if not self.is_realized(row):
+            if not self.is_billable(row):
                 continue
             patient_id = row.get("patient_id") or self.patient_name_for(row)
             item = grouped.setdefault(
@@ -2791,7 +3515,7 @@ class FinancePage(QWidget):
         grouped: dict[str, dict[str, Any]] = {}
         payouts = self.payout_totals_by_professional()
         for row in self.rows:
-            if not self.is_realized(row):
+            if not self.is_billable(row):
                 continue
             professional_id = row.get("professional_id") or self.professional_name_for(row)
             item = grouped.setdefault(
@@ -2810,7 +3534,7 @@ class FinancePage(QWidget):
             fee = self.fee_for(row)
             item["count"] += 1
             item["gross"] += fee
-            item["total_payout"] += fee * 0.70
+            item["total_payout"] = round(item["total_payout"] + self.repo.professional_share(fee), 2)
         for professional_id, item in grouped.items():
             item["paid"] = payouts.get(professional_id, 0.0)
             item["open"] = max(item["total_payout"] - item["paid"], 0)
@@ -2846,7 +3570,7 @@ class FinancePage(QWidget):
             professional = self.professional_name_for(row)
             values = [
                 row.get("appointment_date", ""),
-                f"{row.get('start_time', '')[:5]} as {row.get('end_time', '')[:5]}",
+                f"{row.get('start_time', '')[:5]} às {row.get('end_time', '')[:5]}",
                 patient,
                 professional,
                 row.get("status", ""),
@@ -2909,8 +3633,14 @@ class FinancePage(QWidget):
 
 
 class FinancialAppointmentDialog(QDialog):
-    PAYMENT_STATUSES = ["Nao informado", "Pendente", "Pago", "Cortesia", "Cancelado"]
-    PAYMENT_METHODS = ["", "PIX", "Dinheiro", "Cartao", "Convenio", "Transferencia", "Outro"]
+    PAYMENT_STATUSES = [
+        ("Não informado", "Nao informado"),
+        ("Pendente", "Pendente"),
+        ("Pago", "Pago"),
+        ("Cortesia", "Cortesia"),
+        ("Cancelado", "Cancelado"),
+    ]
+    PAYMENT_METHODS = ["", "PIX", "Dinheiro", "Crédito", "Débito", "Unimed", "Outro"]
 
     def __init__(self, parent: QWidget, appointment: dict[str, Any], repo: SupabaseRepository, money_edit_formatter):
         super().__init__(parent)
@@ -2921,10 +3651,10 @@ class FinancialAppointmentDialog(QDialog):
         self.setMinimumSize(560, 430)
 
         financial = repo.financial_row(appointment)
-        patient = (appointment.get("patients") or {}).get("full_name", "Paciente nao informado")
-        professional = (appointment.get("professionals") or {}).get("full_name", "Funcionario nao informado")
+        patient = (appointment.get("patients") or {}).get("full_name", "Paciente não informado")
+        professional = (appointment.get("professionals") or {}).get("full_name", "Funcionário não informado")
         date_text = appointment.get("appointment_date", "")
-        time_text = f"{appointment.get('start_time', '')[:5]} as {appointment.get('end_time', '')[:5]}"
+        time_text = f"{appointment.get('start_time', '')[:5]} às {appointment.get('end_time', '')[:5]}"
         status_text = appointment.get("status", "")
 
         root = QVBoxLayout(self)
@@ -2959,8 +3689,10 @@ class FinancialAppointmentDialog(QDialog):
         self.consultation_fee = QLineEdit(self.money_edit(financial.get("consultation_fee")))
         self.consultation_fee.setPlaceholderText("Ex.: 150,00")
         self.payment_status = QComboBox()
-        self.payment_status.addItems(self.PAYMENT_STATUSES)
-        self.payment_status.setCurrentText(financial.get("payment_status") or "Nao informado")
+        for label, value in self.PAYMENT_STATUSES:
+            self.payment_status.addItem(label, value)
+        payment_status_index = self.payment_status.findData(financial.get("payment_status") or "Nao informado")
+        self.payment_status.setCurrentIndex(max(payment_status_index, 0))
         self.payment_method = QComboBox()
         self.payment_method.addItems(self.PAYMENT_METHODS)
         self.payment_method.setEditable(True)
@@ -3003,13 +3735,13 @@ class FinancialAppointmentDialog(QDialog):
     def values(self) -> dict[str, Any]:
         return {
             "consultation_fee": self.consultation_fee.text().strip(),
-            "payment_status": self.payment_status.currentText(),
+            "payment_status": self.payment_status.currentData(),
             "payment_method": self.payment_method.currentText().strip(),
         }
 
 
 class PatientReceiptDialog(QDialog):
-    PAYMENT_METHODS = ["PIX", "Dinheiro", "Cartao", "Convenio", "Transferencia", "Outro"]
+    PAYMENT_METHODS = ["PIX", "Dinheiro", "Crédito", "Débito", "Unimed", "Outro"]
 
     def __init__(self, parent: QWidget, repo: SupabaseRepository, money_formatter):
         super().__init__(parent)
@@ -3019,7 +3751,7 @@ class PatientReceiptDialog(QDialog):
         self.receipt_checks: list[QCheckBox] = []
         self.updating_checks = False
         self.setWindowTitle("Registrar recebimento")
-        self.setMinimumSize(1040, 760)
+        self.setMinimumSize(1120, 820)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -3059,19 +3791,19 @@ class PatientReceiptDialog(QDialog):
         self.amount.setPlaceholderText("Ex.: 150,00")
         self.amount.setMinimumHeight(44)
         self.notes = QTextEdit()
-        self.notes.setPlaceholderText("Observacao do recebimento")
-        self.notes.setMinimumHeight(54)
-        self.notes.setMaximumHeight(62)
+        self.notes.setPlaceholderText("Observação do recebimento")
+        self.notes.setMinimumHeight(46)
+        self.notes.setMaximumHeight(52)
 
         self.add_field(form, "Paciente", self.patient, 0, 0)
         self.add_field(form, "Data", self.payment_date, 0, 1)
         self.add_field(form, "Forma de pagamento", self.payment_method, 1, 0)
         self.add_field(form, "Valor recebido", self.amount, 1, 1)
-        form.addWidget(QLabel("Observacao"), 2, 0, 1, 2)
+        form.addWidget(QLabel("Observação"), 2, 0, 1, 2)
         form.addWidget(self.notes, 3, 0, 1, 2)
 
         list_panel = page_card()
-        list_panel.setMinimumHeight(300)
+        list_panel.setMinimumHeight(390)
         list_layout = QVBoxLayout(list_panel)
         list_layout.setContentsMargins(24, 18, 24, 18)
         list_layout.setSpacing(14)
@@ -3083,9 +3815,50 @@ class PatientReceiptDialog(QDialog):
         list_header.addWidget(list_title)
         list_header.addStretch()
         list_header.addWidget(self.total_label)
-        self.table = QTableWidget(0, 6)
-        self.table.setMinimumHeight(210)
-        self.table.setHorizontalHeaderLabels(["Receber", "Data", "Horario", "Valor", "Ja pago", "Em aberto"])
+
+        period_panel = QFrame()
+        period_panel.setStyleSheet(
+            f"""
+            QFrame {{
+                background: {COLORS['surface']};
+                border: 1px solid {COLORS['line']};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                background: transparent;
+                color: {COLORS['text']};
+                font-weight: 600;
+            }}
+            """
+        )
+        period_layout = QHBoxLayout(period_panel)
+        period_layout.setContentsMargins(14, 10, 14, 10)
+        period_layout.setSpacing(12)
+        period_title = QLabel("Selecionar por período")
+        self.period_start = QDateEdit(QDate.currentDate())
+        self.period_start.setCalendarPopup(True)
+        self.period_start.setDisplayFormat("dd/MM/yyyy")
+        self.period_start.setMinimumHeight(38)
+        self.period_start.setMinimumWidth(130)
+        self.period_end = QDateEdit(QDate.currentDate())
+        self.period_end.setCalendarPopup(True)
+        self.period_end.setDisplayFormat("dd/MM/yyyy")
+        self.period_end.setMinimumHeight(38)
+        self.period_end.setMinimumWidth(130)
+        select_period = button("Selecionar período")
+        select_period.setMinimumHeight(38)
+        select_period.clicked.connect(self.select_period_appointments)
+        period_layout.addWidget(period_title)
+        period_layout.addStretch()
+        period_layout.addWidget(QLabel("Início"))
+        period_layout.addWidget(self.period_start)
+        period_layout.addWidget(QLabel("Fim"))
+        period_layout.addWidget(self.period_end)
+        period_layout.addWidget(select_period)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setMinimumHeight(300)
+        self.table.setHorizontalHeaderLabels(["Receber", "Data", "Horário", "Status", "Valor", "Já pago", "Em aberto"])
         table_polish(self.table)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -3125,6 +3898,7 @@ class PatientReceiptDialog(QDialog):
             """
         )
         list_layout.addLayout(list_header)
+        list_layout.addWidget(period_panel)
         list_layout.addWidget(self.table, 1)
 
         actions = QHBoxLayout()
@@ -3184,18 +3958,21 @@ class PatientReceiptDialog(QDialog):
         self.table.setRowCount(len(self.rows))
         for row_index, row in enumerate(self.rows):
             financial = self.repo.financial_row(row)
+            selectable = float(row.get("_open_amount") or 0) > 0.009
             values = [
                 row.get("appointment_date", ""),
-                f"{row.get('start_time', '')[:5]} as {row.get('end_time', '')[:5]}",
+                f"{row.get('start_time', '')[:5]} às {row.get('end_time', '')[:5]}",
+                row.get("status", "Não informado"),
                 self.money(financial.get("consultation_fee")),
                 self.money(row.get("_paid_amount")),
                 self.money(row.get("_open_amount")),
             ]
             check = QCheckBox()
             check.setCursor(Qt.PointingHandCursor)
+            check.setEnabled(selectable)
             check.stateChanged.connect(self.update_selected_total)
             check_holder = QWidget()
-            check_holder.setStyleSheet(f"background: {COLORS['surface']};")
+            check_holder.setStyleSheet(f"background: {COLORS['surface'] if selectable else COLORS['bg2']};")
             check_layout = QHBoxLayout(check_holder)
             check_layout.setContentsMargins(0, 0, 0, 0)
             check_layout.setAlignment(Qt.AlignCenter)
@@ -3207,8 +3984,11 @@ class PatientReceiptDialog(QDialog):
                 item = QTableWidgetItem(str(value or ""))
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 item.setTextAlignment(Qt.AlignCenter)
+                if not selectable:
+                    item.setBackground(QColor(COLORS["bg2"]))
+                    item.setForeground(QColor(COLORS["muted"]))
                 self.table.setItem(row_index, col, item)
-        widths = [70, 120, 140, 120, 120, 140]
+        widths = [80, 130, 140, 150, 120, 120, 150]
         for col, width in enumerate(widths):
             self.table.setColumnWidth(col, width)
         for row_index in range(len(self.rows)):
@@ -3216,10 +3996,43 @@ class PatientReceiptDialog(QDialog):
         self.updating_checks = False
         self.update_selected_total()
 
+    def appointment_date(self, row: dict[str, Any]) -> date | None:
+        raw_date = row.get("appointment_date")
+        if not raw_date:
+            return None
+        if isinstance(raw_date, date):
+            return raw_date
+        try:
+            return date.fromisoformat(str(raw_date)[:10])
+        except ValueError:
+            return None
+
+    def select_period_appointments(self) -> None:
+        start = self.period_start.date().toPython()
+        end = self.period_end.date().toPython()
+        if start > end:
+            start, end = end, start
+
+        self.updating_checks = True
+        try:
+            for row_index, row in enumerate(self.rows):
+                appointment_date = self.appointment_date(row)
+                has_balance = float(row.get("_open_amount") or 0) > 0.009
+                checked = has_balance and appointment_date is not None and start <= appointment_date <= end
+                if row_index < len(self.receipt_checks):
+                    self.receipt_checks[row_index].setChecked(checked)
+        finally:
+            self.updating_checks = False
+        self.update_selected_total()
+
     def selected_total(self) -> float:
         total = 0.0
         for row_index, row in enumerate(self.rows):
-            if row_index < len(self.receipt_checks) and self.receipt_checks[row_index].isChecked():
+            if (
+                row_index < len(self.receipt_checks)
+                and self.receipt_checks[row_index].isEnabled()
+                and self.receipt_checks[row_index].isChecked()
+            ):
                 total += float(row.get("_open_amount") or 0)
         return total
 
@@ -3230,9 +4043,11 @@ class PatientReceiptDialog(QDialog):
         try:
             for row_index in range(self.table.rowCount()):
                 checked = row_index < len(self.receipt_checks) and self.receipt_checks[row_index].isChecked()
+                enabled = row_index < len(self.receipt_checks) and self.receipt_checks[row_index].isEnabled()
                 holder = self.table.cellWidget(row_index, 0)
                 if holder:
-                    holder.setStyleSheet(f"background: {COLORS['primary_soft'] if checked else COLORS['surface']};")
+                    background = COLORS["primary_soft"] if checked else COLORS["surface"] if enabled else COLORS["bg2"]
+                    holder.setStyleSheet(f"background: {background};")
                 for col in range(self.table.columnCount()):
                     item = self.table.item(row_index, col)
                     if not item:
@@ -3247,7 +4062,11 @@ class PatientReceiptDialog(QDialog):
     def selected_items(self) -> list[dict[str, Any]]:
         items = []
         for row_index, row in enumerate(self.rows):
-            if row_index < len(self.receipt_checks) and self.receipt_checks[row_index].isChecked():
+            if (
+                row_index < len(self.receipt_checks)
+                and self.receipt_checks[row_index].isEnabled()
+                and self.receipt_checks[row_index].isChecked()
+            ):
                 items.append({"appointment_id": row["id"], "open_amount": float(row.get("_open_amount") or 0)})
         return items
 
@@ -3262,7 +4081,7 @@ class PatientReceiptDialog(QDialog):
 
 
 class ProfessionalPayoutDialog(QDialog):
-    PAYMENT_METHODS = ["PIX", "Dinheiro", "Transferencia", "Outro"]
+    PAYMENT_METHODS = ["PIX", "Dinheiro", "Crédito", "Débito", "Unimed", "Outro"]
 
     def __init__(self, parent: QWidget, repo: SupabaseRepository, money_formatter):
         super().__init__(parent)
@@ -3282,7 +4101,7 @@ class ProfessionalPayoutDialog(QDialog):
         style_card(header, COLORS["surface_warm"])
         header_layout = QVBoxLayout(header)
         header_layout.setContentsMargins(18, 12, 18, 12)
-        title = QLabel("Repasse de funcionario")
+        title = QLabel("Repasse de funcionário")
         title.setObjectName("PageTitle")
         title.setStyleSheet("font-size: 21px; background: transparent;")
         subtitle = QLabel("Selecione os atendimentos realizados que entram neste repasse.")
@@ -3312,15 +4131,15 @@ class ProfessionalPayoutDialog(QDialog):
         self.amount.setPlaceholderText("Ex.: 105,00")
         self.amount.setMinimumHeight(44)
         self.notes = QTextEdit()
-        self.notes.setPlaceholderText("Observacao do repasse")
+        self.notes.setPlaceholderText("Observação do repasse")
         self.notes.setMinimumHeight(54)
         self.notes.setMaximumHeight(62)
 
-        self.add_field(form, "Funcionario", self.professional, 0, 0)
+        self.add_field(form, "Funcionário", self.professional, 0, 0)
         self.add_field(form, "Data", self.payout_date, 0, 1)
         self.add_field(form, "Forma de pagamento", self.payment_method, 1, 0)
         self.add_field(form, "Valor do repasse", self.amount, 1, 1)
-        form.addWidget(QLabel("Observacao"), 2, 0, 1, 2)
+        form.addWidget(QLabel("Observação"), 2, 0, 1, 2)
         form.addWidget(self.notes, 3, 0, 1, 2)
 
         list_panel = page_card()
@@ -3336,9 +4155,50 @@ class ProfessionalPayoutDialog(QDialog):
         list_header.addWidget(list_title)
         list_header.addStretch()
         list_header.addWidget(self.total_label)
+
+        period_panel = QFrame()
+        period_panel.setStyleSheet(
+            f"""
+            QFrame {{
+                background: {COLORS['surface']};
+                border: 1px solid {COLORS['line']};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                background: transparent;
+                color: {COLORS['text']};
+                font-weight: 600;
+            }}
+            """
+        )
+        period_layout = QHBoxLayout(period_panel)
+        period_layout.setContentsMargins(14, 10, 14, 10)
+        period_layout.setSpacing(12)
+        period_title = QLabel("Selecionar por período")
+        self.period_start = QDateEdit(QDate.currentDate())
+        self.period_start.setCalendarPopup(True)
+        self.period_start.setDisplayFormat("dd/MM/yyyy")
+        self.period_start.setMinimumHeight(38)
+        self.period_start.setMinimumWidth(130)
+        self.period_end = QDateEdit(QDate.currentDate())
+        self.period_end.setCalendarPopup(True)
+        self.period_end.setDisplayFormat("dd/MM/yyyy")
+        self.period_end.setMinimumHeight(38)
+        self.period_end.setMinimumWidth(130)
+        select_period = button("Selecionar período")
+        select_period.setMinimumHeight(38)
+        select_period.clicked.connect(self.select_period_appointments)
+        period_layout.addWidget(period_title)
+        period_layout.addStretch()
+        period_layout.addWidget(QLabel("Início"))
+        period_layout.addWidget(self.period_start)
+        period_layout.addWidget(QLabel("Fim"))
+        period_layout.addWidget(self.period_end)
+        period_layout.addWidget(select_period)
+
         self.table = QTableWidget(0, 7)
         self.table.setMinimumHeight(210)
-        self.table.setHorizontalHeaderLabels(["Pagar", "Data", "Horario", "Paciente", "Bruto", "Ja pago", "A pagar"])
+        self.table.setHorizontalHeaderLabels(["Pagar", "Data", "Horário", "Paciente", "Bruto", "Já pago", "A pagar"])
         table_polish(self.table)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -3378,6 +4238,7 @@ class ProfessionalPayoutDialog(QDialog):
             """
         )
         list_layout.addLayout(list_header)
+        list_layout.addWidget(period_panel)
         list_layout.addWidget(self.table, 1)
 
         actions = QHBoxLayout()
@@ -3437,9 +4298,10 @@ class ProfessionalPayoutDialog(QDialog):
         self.table.setRowCount(len(self.rows))
         for row_index, row in enumerate(self.rows):
             patient = (row.get("patients") or {}).get("full_name", "")
+            selectable = float(row.get("_open_payout_amount") or 0) > 0.009
             values = [
                 row.get("appointment_date", ""),
-                f"{row.get('start_time', '')[:5]} as {row.get('end_time', '')[:5]}",
+                f"{row.get('start_time', '')[:5]} às {row.get('end_time', '')[:5]}",
                 patient,
                 self.money(row.get("_gross_amount")),
                 self.money(row.get("_paid_payout_amount")),
@@ -3448,9 +4310,10 @@ class ProfessionalPayoutDialog(QDialog):
 
             check = QCheckBox()
             check.setCursor(Qt.PointingHandCursor)
+            check.setEnabled(selectable)
             check.stateChanged.connect(self.update_selected_total)
             check_holder = QWidget()
-            check_holder.setStyleSheet(f"background: {COLORS['surface']};")
+            check_holder.setStyleSheet(f"background: {COLORS['surface'] if selectable else COLORS['bg2']};")
             check_layout = QHBoxLayout(check_holder)
             check_layout.setContentsMargins(0, 0, 0, 0)
             check_layout.setAlignment(Qt.AlignCenter)
@@ -3462,6 +4325,9 @@ class ProfessionalPayoutDialog(QDialog):
                 item = QTableWidgetItem(str(value or ""))
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 item.setTextAlignment(Qt.AlignCenter)
+                if not selectable:
+                    item.setBackground(QColor(COLORS["bg2"]))
+                    item.setForeground(QColor(COLORS["muted"]))
                 self.table.setItem(row_index, col, item)
         widths = [70, 110, 120, 220, 110, 110, 120]
         for col, width in enumerate(widths):
@@ -3471,10 +4337,43 @@ class ProfessionalPayoutDialog(QDialog):
         self.updating_checks = False
         self.update_selected_total()
 
+    def appointment_date(self, row: dict[str, Any]) -> date | None:
+        raw_date = row.get("appointment_date")
+        if not raw_date:
+            return None
+        if isinstance(raw_date, date):
+            return raw_date
+        try:
+            return date.fromisoformat(str(raw_date)[:10])
+        except ValueError:
+            return None
+
+    def select_period_appointments(self) -> None:
+        start = self.period_start.date().toPython()
+        end = self.period_end.date().toPython()
+        if start > end:
+            start, end = end, start
+
+        self.updating_checks = True
+        try:
+            for row_index, row in enumerate(self.rows):
+                appointment_date = self.appointment_date(row)
+                has_balance = float(row.get("_open_payout_amount") or 0) > 0.009
+                checked = has_balance and appointment_date is not None and start <= appointment_date <= end
+                if row_index < len(self.payout_checks):
+                    self.payout_checks[row_index].setChecked(checked)
+        finally:
+            self.updating_checks = False
+        self.update_selected_total()
+
     def selected_total(self) -> float:
         total = 0.0
         for row_index, row in enumerate(self.rows):
-            if row_index < len(self.payout_checks) and self.payout_checks[row_index].isChecked():
+            if (
+                row_index < len(self.payout_checks)
+                and self.payout_checks[row_index].isEnabled()
+                and self.payout_checks[row_index].isChecked()
+            ):
                 total += float(row.get("_open_payout_amount") or 0)
         return total
 
@@ -3485,9 +4384,11 @@ class ProfessionalPayoutDialog(QDialog):
         try:
             for row_index in range(self.table.rowCount()):
                 checked = row_index < len(self.payout_checks) and self.payout_checks[row_index].isChecked()
+                enabled = row_index < len(self.payout_checks) and self.payout_checks[row_index].isEnabled()
                 holder = self.table.cellWidget(row_index, 0)
                 if holder:
-                    holder.setStyleSheet(f"background: {COLORS['primary_soft'] if checked else COLORS['surface']};")
+                    background = COLORS["primary_soft"] if checked else COLORS["surface"] if enabled else COLORS["bg2"]
+                    holder.setStyleSheet(f"background: {background};")
                 for col in range(self.table.columnCount()):
                     item = self.table.item(row_index, col)
                     if not item:
@@ -3502,7 +4403,11 @@ class ProfessionalPayoutDialog(QDialog):
     def selected_items(self) -> list[dict[str, Any]]:
         items = []
         for row_index, row in enumerate(self.rows):
-            if row_index < len(self.payout_checks) and self.payout_checks[row_index].isChecked():
+            if (
+                row_index < len(self.payout_checks)
+                and self.payout_checks[row_index].isEnabled()
+                and self.payout_checks[row_index].isChecked()
+            ):
                 items.append({"appointment_id": row["id"], "open_amount": float(row.get("_open_payout_amount") or 0)})
         return items
 
@@ -3533,7 +4438,7 @@ class DocumentUploadDialog(QDialog):
         header_layout.setContentsMargins(18, 14, 18, 14)
         title = QLabel("Enviar documento")
         title.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-size: 20px; font-weight: 800;")
-        subtitle = QLabel("Escolha o arquivo e o profissional responsavel pelo documento.")
+        subtitle = QLabel("Escolha o arquivo e o profissional responsável pelo documento.")
         subtitle.setObjectName("Muted")
         subtitle.setStyleSheet("background: transparent;")
         header_layout.addWidget(title)
@@ -3564,7 +4469,7 @@ class DocumentUploadDialog(QDialog):
         choose_file.clicked.connect(self.choose_file)
 
         self.description = QTextEdit()
-        self.description.setPlaceholderText("Descricao breve para identificar o documento")
+        self.description.setPlaceholderText("Descrição breve para identificar o documento")
         self.description.setFixedHeight(96)
 
         form.addLayout(self.field("Profissional", self.professional), 0, 0)
@@ -3573,7 +4478,7 @@ class DocumentUploadDialog(QDialog):
         file_row.addWidget(self.file_path, 1)
         file_row.addWidget(choose_file)
         form.addLayout(self.field("Arquivo", file_row), 0, 1)
-        form.addLayout(self.field("Descricao", self.description), 1, 0, 1, 2)
+        form.addLayout(self.field("Descrição", self.description), 1, 0, 1, 2)
         form.setColumnStretch(0, 1)
         form.setColumnStretch(1, 1)
         layout.addWidget(form_card, 1)
@@ -3670,7 +4575,7 @@ class DocumentsPage(QWidget):
         header.addWidget(self.badge)
 
         self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Documento", "Profissional", "Tipo", "Tamanho", "Enviado em", "Descricao"])
+        self.table.setHorizontalHeaderLabels(["Documento", "Profissional", "Tipo", "Tamanho", "Enviado em", "Descrição"])
         full_row_table_polish(self.table)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -3682,15 +4587,16 @@ class DocumentsPage(QWidget):
         layout.addWidget(subtitle)
         layout.addWidget(filters_panel)
         layout.addWidget(panel, 1)
-        self.load_professionals()
-        self.refresh()
+        self.professionals_loaded = False
 
     def load_professionals(self) -> None:
         try:
             self.professionals = self.repo.document_professionals()
+            self.professionals_loaded = True
         except Exception as exc:
             show_error(self, exc)
             self.professionals = []
+            self.professionals_loaded = False
         self.professional_filter.blockSignals(True)
         self.professional_filter.clear()
         if self.can_view_all:
@@ -3703,6 +4609,8 @@ class DocumentsPage(QWidget):
         self.professional_filter.blockSignals(False)
 
     def refresh(self) -> None:
+        if not self.professionals_loaded:
+            self.load_professionals()
         try:
             professional_id = self.professional_filter.currentData() if self.can_view_all else self.profile.get("id")
             self.rows = self.repo.documents(self.search.text().strip(), professional_id)
@@ -3778,7 +4686,7 @@ class DocumentsPage(QWidget):
         answer = QMessageBox.question(
             self,
             "Excluir documento",
-            "Este arquivo sera removido definitivamente e nao podera ser recuperado. Deseja continuar?",
+            "Este arquivo será removido definitivamente e não poderá ser recuperado. Deseja continuar?",
         )
         if answer != QMessageBox.Yes:
             return
@@ -3892,43 +4800,43 @@ class SettingsPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(16)
-        title = QLabel("Configuracoes")
+        title = QLabel("Configurações")
         title.setObjectName("PageTitle")
-        text = QLabel("Usuarios, permissoes por perfil, status e backup simples.")
+        text = QLabel("Usuários, permissões por perfil, status e backup simples.")
         text.setObjectName("Muted")
 
         users_actions = QHBoxLayout()
-        new_user = button("Novo usuario")
+        new_user = button("Novo usuário")
         new_user.clicked.connect(self.create_user)
-        edit_user = button("Editar permissoes", secondary=True)
+        edit_user = button("Editar permissões", secondary=True)
         edit_user.clicked.connect(self.edit_selected_user)
-        delete_user = button("Excluir funcionario", danger=True)
+        delete_user = button("Excluir funcionário", danger=True)
         delete_user.clicked.connect(self.delete_selected_user)
         users_actions.addWidget(new_user)
         users_actions.addWidget(edit_user)
         users_actions.addWidget(delete_user)
         users_actions.addStretch()
 
-        users_title = QLabel("Usuarios do sistema")
+        users_title = QLabel("Usuários do sistema")
         users_title.setObjectName("PageTitle")
         users_title.setStyleSheet("font-size: 18px;")
         self.users_table = QTableWidget(0, 9)
-        self.users_table.setHorizontalHeaderLabels(["Nome", "E-mail", "Permissao", "Status", "Atende", "Especialidade", "CPF", "Telefone", "Cidade"])
+        self.users_table.setHorizontalHeaderLabels(["Nome", "E-mail", "Permissão", "Status", "Atende", "Especialidade", "CPF", "Telefone", "Cidade"])
         table_polish(self.users_table)
         self.users_table.cellDoubleClicked.connect(lambda row, col: self.edit_user(row))
 
-        permissions_title = QLabel("Resumo das permissoes")
+        permissions_title = QLabel("Resumo das permissões")
         permissions_title.setObjectName("PageTitle")
         permissions_title.setStyleSheet("font-size: 18px;")
         export = button("Exportar backup JSON")
         export.clicked.connect(self.export_backup)
         self.table = QTableWidget(3, 4)
-        self.table.setHorizontalHeaderLabels(["Perfil", "Pacientes", "Agenda", "Configuracoes"])
+        self.table.setHorizontalHeaderLabels(["Perfil", "Pacientes", "Agenda", "Configurações"])
         table_polish(self.table)
         rows = [
             ("Administrador", "Sim", "Sim", "Sim"),
-            ("Recepcao", "Sim", "Sim", "Sim"),
-            ("Profissional", "Nao", "Propria agenda", "Nao"),
+            ("Recepção", "Sim", "Sim", "Sim"),
+            ("Profissional", "Não", "Própria agenda", "Não"),
         ]
         for row_idx, row in enumerate(rows):
             for col_idx, value in enumerate(row):
@@ -3942,7 +4850,6 @@ class SettingsPage(QWidget):
         layout.addWidget(self.table)
         layout.addWidget(export)
         layout.addStretch()
-        self.refresh()
 
     def refresh(self) -> None:
         try:
@@ -3957,7 +4864,7 @@ class SettingsPage(QWidget):
                 row.get("email", ""),
                 ROLE_LABELS.get(row.get("role"), row.get("role", "")),
                 "Ativo" if row.get("is_active") else "Inativo",
-                "Sim" if row.get("can_attend") else "Nao",
+                "Sim" if row.get("can_attend") else "Não",
                 row.get("specialty", ""),
                 row.get("cpf", ""),
                 row.get("phone", ""),
@@ -3978,7 +4885,7 @@ class SettingsPage(QWidget):
         if dialog.exec():
             try:
                 self.repo.create_system_user(dialog.values())
-                QMessageBox.information(self, "Usuario", "Usuario criado com sucesso.")
+                QMessageBox.information(self, "Usuário", "Usuário criado com sucesso.")
                 self.refresh()
             except Exception as exc:
                 show_error(self, exc)
@@ -3992,8 +4899,8 @@ class SettingsPage(QWidget):
             return
         answer = QMessageBox.question(
             self,
-            "Excluir funcionario",
-            f"Deseja apagar o funcionario {profile.get('full_name', '')}?",
+            "Excluir funcionário",
+            f"Deseja apagar o funcionário {profile.get('full_name', '')}?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -4032,7 +4939,7 @@ class SettingsPage(QWidget):
 class NewUserDialog(QDialog):
     def __init__(self, parent: QWidget):
         super().__init__(parent)
-        self.setWindowTitle("Novo usuario")
+        self.setWindowTitle("Novo usuário")
         self.setMinimumSize(860, 520)
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
@@ -4056,7 +4963,7 @@ class NewUserDialog(QDialog):
         self.password.setEchoMode(QLineEdit.Password)
         self.role = QComboBox()
         self.role.addItem("Administrador", "admin")
-        self.role.addItem("Recepcao", "reception")
+        self.role.addItem("Recepção", "reception")
         self.role.addItem("Profissional", "professional")
         self.active = QCheckBox("Ativo")
         self.active.setChecked(True)
@@ -4076,14 +4983,14 @@ class NewUserDialog(QDialog):
         self.specialty.addItems(SPECIALTIES)
         self.can_attend.stateChanged.connect(self.sync_attendance_fields)
         self.role.currentIndexChanged.connect(self.sync_role_defaults)
-        save = button("Criar usuario")
+        save = button("Criar usuário")
         save.clicked.connect(self.accept)
         hint = QLabel("A senha deve ter pelo menos 6 caracteres.")
         hint.setObjectName("Muted")
         self.add_field(personal_layout, "Nome completo", self.full_name, 0, 0)
         self.add_field(personal_layout, "E-mail", self.email, 0, 1)
         self.add_field(personal_layout, "Senha inicial", self.password, 1, 0)
-        self.add_field(personal_layout, "Permissao", self.role, 1, 1)
+        self.add_field(personal_layout, "Permissão", self.role, 1, 1)
         self.add_field(personal_layout, "CPF", self.cpf, 2, 0)
         self.add_field(personal_layout, "RG", self.rg, 2, 1)
         self.add_field(personal_layout, "Telefone", self.phone, 3, 0)
@@ -4095,7 +5002,7 @@ class NewUserDialog(QDialog):
 
         self.add_field(address_layout, "CEP", self.zip_code, 0, 0)
         self.add_field(address_layout, "Rua", self.street, 0, 1)
-        self.add_field(address_layout, "Numero", self.address_number, 1, 0)
+        self.add_field(address_layout, "Número", self.address_number, 1, 0)
         self.add_field(address_layout, "Complemento", self.address_complement, 1, 1)
         self.add_field(address_layout, "Bairro", self.neighborhood, 2, 0)
         self.add_field(address_layout, "Cidade", self.city, 2, 1)
@@ -4103,15 +5010,15 @@ class NewUserDialog(QDialog):
         address_layout.setRowStretch(4, 1)
 
         self.history_table = QTableWidget(0, 4)
-        self.history_table.setHorizontalHeaderLabels(["Data", "Horario", "Paciente", "Status"])
+        self.history_table.setHorizontalHeaderLabels(["Data", "Horário", "Paciente", "Status"])
         table_polish(self.history_table)
         self.fill_history([])
-        attendance_layout.addWidget(QLabel("Historico de atendimentos"), 0, 0)
+        attendance_layout.addWidget(QLabel("Histórico de atendimentos"), 0, 0)
         attendance_layout.addWidget(self.history_table, 1, 0, 1, 2)
         attendance_layout.setRowStretch(1, 1)
 
         tabs.addTab(personal_tab, "Dados pessoais")
-        tabs.addTab(address_tab, "Endereco")
+        tabs.addTab(address_tab, "Endereço")
         tabs.addTab(attendance_tab, "Atendimento")
         actions = QHBoxLayout()
         actions.addStretch()
@@ -4131,7 +5038,7 @@ class NewUserDialog(QDialog):
         if not rows:
             self.history_table.setRowCount(1)
             self.history_table.setSpan(0, 0, 1, 4)
-            self.history_table.setItem(0, 0, QTableWidgetItem("Historico disponivel depois que o usuario tiver atendimentos."))
+            self.history_table.setItem(0, 0, QTableWidgetItem("Histórico disponível depois que o usuário tiver atendimentos."))
             return
         self.history_table.setRowCount(len(rows))
 
@@ -4191,7 +5098,7 @@ class ProfilePermissionsDialog(QDialog):
         super().__init__(parent)
         self.repo = repo
         self.profile = profile
-        self.setWindowTitle("Funcionario do sistema")
+        self.setWindowTitle("Funcionário do sistema")
         self.setMinimumSize(860, 520)
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
@@ -4226,7 +5133,7 @@ class ProfilePermissionsDialog(QDialog):
         password_layout.addWidget(self.change_password_btn)
         self.role = QComboBox()
         self.role.addItem("Administrador", "admin")
-        self.role.addItem("Recepcao", "reception")
+        self.role.addItem("Recepção", "reception")
         self.role.addItem("Profissional", "professional")
         role_index = self.role.findData(profile.get("role"))
         if role_index >= 0:
@@ -4251,10 +5158,10 @@ class ProfilePermissionsDialog(QDialog):
         if profile.get("specialty") in SPECIALTIES:
             self.specialty.setCurrentText(profile["specialty"])
         self.can_attend.stateChanged.connect(self.sync_attendance_fields)
-        save = button("Salvar funcionario")
+        save = button("Salvar funcionário")
         save.clicked.connect(self.accept)
         self.add_field(personal_layout, "Nome completo", self.full_name, 0, 0)
-        self.add_field(personal_layout, "Permissao", self.role, 0, 1)
+        self.add_field(personal_layout, "Permissão", self.role, 0, 1)
         self.add_field(personal_layout, "E-mail de login", self.email, 1, 0)
         self.add_field(personal_layout, "Senha", password_box, 1, 1)
         self.add_field(personal_layout, "CPF", self.cpf, 2, 0)
@@ -4267,7 +5174,7 @@ class ProfilePermissionsDialog(QDialog):
 
         self.add_field(address_layout, "CEP", self.zip_code, 0, 0)
         self.add_field(address_layout, "Rua", self.street, 0, 1)
-        self.add_field(address_layout, "Numero", self.address_number, 1, 0)
+        self.add_field(address_layout, "Número", self.address_number, 1, 0)
         self.add_field(address_layout, "Complemento", self.address_complement, 1, 1)
         self.add_field(address_layout, "Bairro", self.neighborhood, 2, 0)
         self.add_field(address_layout, "Cidade", self.city, 2, 1)
@@ -4275,15 +5182,15 @@ class ProfilePermissionsDialog(QDialog):
         address_layout.setRowStretch(4, 1)
 
         self.history_table = QTableWidget(0, 4)
-        self.history_table.setHorizontalHeaderLabels(["Data", "Horario", "Paciente", "Status"])
+        self.history_table.setHorizontalHeaderLabels(["Data", "Horário", "Paciente", "Status"])
         table_polish(self.history_table)
         self.fill_history()
-        attendance_layout.addWidget(QLabel("Historico de atendimentos"), 0, 0)
+        attendance_layout.addWidget(QLabel("Histórico de atendimentos"), 0, 0)
         attendance_layout.addWidget(self.history_table, 1, 0, 1, 2)
         attendance_layout.setRowStretch(1, 1)
 
         tabs.addTab(personal_tab, "Dados pessoais")
-        tabs.addTab(address_tab, "Endereco")
+        tabs.addTab(address_tab, "Endereço")
         tabs.addTab(attendance_tab, "Atendimento")
         actions = QHBoxLayout()
         actions.addStretch()
@@ -4306,13 +5213,13 @@ class ProfilePermissionsDialog(QDialog):
             return
         auth_user_id = self.profile.get("auth_user_id", "")
         if not auth_user_id:
-            show_error(self, AppError("Este funcionario nao possui Auth ID vinculado."))
+            show_error(self, AppError("Este funcionário não possui Auth ID vinculado."))
             return
-        email = self.email.text().strip() or "e-mail nao informado"
+        email = self.email.text().strip() or "e-mail não informado"
         answer = QMessageBox.question(
             self,
             "Trocar senha",
-            f"Deseja trocar a senha do usuario {email}?",
+            f"Deseja trocar a senha do usuário {email}?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -4324,7 +5231,7 @@ class ProfilePermissionsDialog(QDialog):
             QMessageBox.information(
                 self,
                 "Trocar senha",
-                "Senha alterada com sucesso. Informe a nova senha ao funcionario.",
+                "Senha alterada com sucesso. Informe a nova senha ao funcionário.",
             )
         except Exception as exc:
             show_error(self, exc)
@@ -4337,14 +5244,14 @@ class ProfilePermissionsDialog(QDialog):
         if not rows:
             self.history_table.setRowCount(1)
             self.history_table.setSpan(0, 0, 1, 4)
-            self.history_table.setItem(0, 0, QTableWidgetItem("Nenhum atendimento vinculado a este funcionario."))
+            self.history_table.setItem(0, 0, QTableWidgetItem("Nenhum atendimento vinculado a este funcionário."))
             return
         self.history_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             patient = (row.get("patients") or {}).get("full_name", "")
             values = [
                 row.get("appointment_date", ""),
-                f"{row.get('start_time', '')[:5]} as {row.get('end_time', '')[:5]}",
+                f"{row.get('start_time', '')[:5]} às {row.get('end_time', '')[:5]}",
                 patient,
                 row.get("status", ""),
             ]
@@ -4407,14 +5314,15 @@ def main() -> int:
     if not settings.is_configured:
         QMessageBox.warning(
             None,
-            "Configuracao necessaria",
+            "Configuração necessária",
             "Configure SUPABASE_URL e SUPABASE_ANON_KEY no arquivo .env antes de entrar.",
         )
     try:
         repo = SupabaseRepository(settings)
         login = LoginWindow(repo)
         login.show()
+        QTimer.singleShot(1500, lambda: start_update_check(app, login))
         return app.exec()
     except AppError as exc:
-        QMessageBox.critical(None, "Clinica Agape", str(exc))
+        QMessageBox.critical(None, "Clínica Agape", str(exc))
         return 1
