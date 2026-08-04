@@ -419,6 +419,11 @@ class LoginWindow(QWidget):
         root.addStretch()
         root.addWidget(panel)
         root.addStretch()
+        version_label = QLabel(f"Versão {APP_VERSION}")
+        version_label.setObjectName("Muted")
+        version_label.setStyleSheet("background: transparent;")
+        version_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        root.addWidget(version_label)
 
     def handle_login(self) -> None:
         self.error.clear()
