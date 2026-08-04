@@ -62,6 +62,10 @@ backups/
 codex-clipboard-*.png
 *_preview.png
 
+# Artefatos gerados
+dist/
+build/
+release/
+
+# PDFs locais, se não forem necessários
 *.pdf
-*.txt
-*
