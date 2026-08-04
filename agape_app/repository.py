@@ -617,10 +617,12 @@ class SupabaseRepository:
         end_time: str | None = None,
         status: str | None = None,
         consultation_fee: Any | None = None,
+        professional_id: str | None = None,
+        patient_id: str | None = None,
     ) -> int:
         if not appointments:
             raise AppError("Selecione pelo menos um atendimento.")
-        if not any((start_time, end_time, status, consultation_fee is not None)):
+        if not any((start_time, end_time, status, consultation_fee is not None, professional_id, patient_id)):
             raise AppError("Escolha pelo menos uma alteração para aplicar.")
         if bool(start_time) != bool(end_time):
             raise AppError("Informe os horários inicial e final.")
@@ -638,16 +640,22 @@ class SupabaseRepository:
                 "start_time": start_time or row["start_time"],
                 "end_time": end_time or row["end_time"],
                 "status": status or row["status"],
+                "professional_id": professional_id or row["professional_id"],
+                "patient_id": patient_id or row["patient_id"],
             }
             payload: dict[str, Any] = {}
             if start_time and end_time:
                 payload.update({"start_time": start_time, "end_time": end_time})
             if status:
                 payload["status"] = status
+            if professional_id:
+                payload["professional_id"] = professional_id
+            if patient_id:
+                payload["patient_id"] = patient_id
             conflicts = (
                 self.client.table("appointments")
                 .select("id")
-                .eq("professional_id", row["professional_id"])
+                .eq("professional_id", target["professional_id"])
                 .eq("appointment_date", target["appointment_date"])
                 .neq("status", "Cancelado")
                 .lt("start_time", target["end_time"])
@@ -672,7 +680,7 @@ class SupabaseRepository:
                 if other_target["status"] == "Cancelado":
                     continue
                 if (
-                    row["professional_id"] == other_row["professional_id"]
+                    target["professional_id"] == other_target["professional_id"]
                     and target["appointment_date"] == other_target["appointment_date"]
                     and target["start_time"] < other_target["end_time"]
                     and target["end_time"] > other_target["start_time"]

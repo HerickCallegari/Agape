@@ -113,7 +113,7 @@ class BulkUpdateTests(unittest.TestCase):
             lambda appointment_id, values: self.saved_financials.append((appointment_id, values))
         )
         self.row = {
-            "id": "appointment-1", "professional_id": "professional-1",
+            "id": "appointment-1", "professional_id": "professional-1", "patient_id": "patient-1",
             "appointment_date": "2026-08-03", "start_time": "08:00:00",
             "end_time": "09:00:00", "status": "Agendado", "patients": {"full_name": "Paciente"},
         }
@@ -133,6 +133,16 @@ class BulkUpdateTests(unittest.TestCase):
         self.assertEqual(
             self.repo.client.updates,
             [{"start_time": "10:00:00", "end_time": "11:00:00"}],
+        )
+        self.assertEqual(self.saved_financials, [])
+
+    def test_professional_and_patient_can_be_reassigned(self):
+        self.repo.update_appointments_bulk(
+            [self.row], professional_id="professional-2", patient_id="patient-2"
+        )
+        self.assertEqual(
+            self.repo.client.updates,
+            [{"professional_id": "professional-2", "patient_id": "patient-2"}],
         )
         self.assertEqual(self.saved_financials, [])
 

@@ -2015,23 +2015,31 @@ class BulkAppointmentEditDialog(QDialog):
         self.end_date = QDateEdit(today.addMonths(1))
         self.start_date.setCalendarPopup(True)
         self.end_date.setCalendarPopup(True)
+        self.weekday_filter = QComboBox()
+        self.weekday_filter.addItem("Todos os dias", None)
+        for weekday, label in enumerate(
+            ["Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado", "Domingo"]
+        ):
+            self.weekday_filter.addItem(label, weekday)
         self.professional = QComboBox()
         self.professional.addItem("Todos os profissionais", None)
-        for item in repo.professionals(active_only=False):
+        professionals = repo.professionals(active_only=False)
+        for item in professionals:
             self.professional.addItem(item["full_name"], item["id"])
         self.patient = QComboBox()
         self.patient.addItem("Todos os pacientes", None)
-        for item in repo.patients(active_only=False):
+        patients = repo.patients(active_only=False)
+        for item in patients:
             self.patient.addItem(item["full_name"], item["id"])
         search = button("Buscar", secondary=True)
         search.clicked.connect(self.load_rows)
         for column, (label, widget) in enumerate(
-            [("Data inicial", self.start_date), ("Data final", self.end_date),
+            [("Data inicial", self.start_date), ("Data final", self.end_date), ("Dia da semana", self.weekday_filter),
              ("Profissional", self.professional), ("Paciente", self.patient)]
         ):
             filters.addWidget(QLabel(label), 0, column)
             filters.addWidget(widget, 1, column)
-        filters.addWidget(search, 1, 4)
+        filters.addWidget(search, 1, 5)
         layout.addLayout(filters)
 
         self.table = QTableWidget(0, 7)
@@ -2092,6 +2100,14 @@ class BulkAppointmentEditDialog(QDialog):
             self.status.addItem(status, status)
         self.fee = QLineEdit()
         self.fee.setPlaceholderText("Ex.: 150,00")
+        self.target_professional = QComboBox()
+        self.target_professional.addItem("Não alterar", None)
+        for item in professionals:
+            self.target_professional.addItem(item["full_name"], item["id"])
+        self.target_patient = QComboBox()
+        self.target_patient.addItem("Não alterar", None)
+        for item in patients:
+            self.target_patient.addItem(item["full_name"], item["id"])
         time_box = QVBoxLayout()
         time_fields = QHBoxLayout()
         start_box = QVBoxLayout()
@@ -2119,6 +2135,14 @@ class BulkAppointmentEditDialog(QDialog):
         fee_title.setStyleSheet("background: transparent;")
         changes_layout.addWidget(fee_title, 0, 2)
         changes_layout.addWidget(self.fee, 1, 2)
+        professional_title = QLabel("Alterar profissional")
+        professional_title.setStyleSheet("background: transparent;")
+        changes_layout.addWidget(professional_title, 2, 0)
+        changes_layout.addWidget(self.target_professional, 3, 0)
+        patient_title = QLabel("Alterar paciente")
+        patient_title.setStyleSheet("background: transparent;")
+        changes_layout.addWidget(patient_title, 2, 1)
+        changes_layout.addWidget(self.target_patient, 3, 1, 1, 2)
         changes_layout.setColumnStretch(0, 2)
         changes_layout.setColumnStretch(1, 1)
         changes_layout.setColumnStretch(2, 2)
@@ -2165,6 +2189,12 @@ class BulkAppointmentEditDialog(QDialog):
                 self.start_date.date().toPython(), self.end_date.date().toPython(),
                 patient_id=self.patient.currentData(), professional_id=self.professional.currentData(),
             )
+            weekday = self.weekday_filter.currentData()
+            if weekday is not None:
+                self.rows = [
+                    row for row in self.rows
+                    if date.fromisoformat(row["appointment_date"]).weekday() == weekday
+                ]
         except Exception as exc:
             show_error(self, exc)
             return
@@ -2266,7 +2296,7 @@ class BulkAppointmentEditDialog(QDialog):
             return
         answer = QMessageBox.question(
             self, "Confirmar alterações",
-            f"Aplicar as alterações em {len(selected)} atendimento(s)?\n\nPaciente e profissional não serão modificados.",
+            f"Aplicar as alterações em {len(selected)} atendimento(s)?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
@@ -2278,6 +2308,8 @@ class BulkAppointmentEditDialog(QDialog):
                 end_time=f"{end_time}:00" if end_time else None,
                 status=self.status.currentData(),
                 consultation_fee=self.fee.text().strip() or None,
+                professional_id=self.target_professional.currentData(),
+                patient_id=self.target_patient.currentData(),
             )
             QMessageBox.information(self, "Atendimentos alterados", f"{count} atendimento(s) atualizado(s).")
             self.accept()
