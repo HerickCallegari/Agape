@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStackedWidget,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
@@ -46,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import load_settings
+from .financial_rules import appointment_is_selectable, current_month_period
 from .permissions import Permission, ROLE_LABELS, can
 from .repository import AppError, SupabaseRepository
 from .theme import APP_STYLESHEET, COLORS, STATUS_COLORS
@@ -53,6 +55,27 @@ from .updater import ReleaseInfo, download_installer, latest_release
 from .version import APP_VERSION
 
 STATUSES = ["Agendado", "Confirmado", "Atendido", "Falta com aviso", "Falta sem aviso", "Cancelado"]
+FINANCIAL_ROW_SELECTED_ROLE = Qt.UserRole + 20
+
+
+class FinancialRowDelegate(QStyledItemDelegate):
+    """Paint checkbox-selected rows consistently without using table selection."""
+
+    def paint(self, painter, option, index) -> None:
+        selected = bool(index.data(FINANCIAL_ROW_SELECTED_ROLE))
+        background = COLORS["primary_soft"] if selected else "#FBFCFE" if index.row() % 2 else COLORS["surface"]
+        foreground = index.data(Qt.ForegroundRole)
+        text_color = foreground.color() if isinstance(foreground, QBrush) else QColor(COLORS["text"])
+        painter.save()
+        painter.fillRect(option.rect, QColor(background))
+        painter.setPen(text_color)
+        painter.setFont(option.font)
+        painter.drawText(
+            option.rect.adjusted(6, 2, -6, -2),
+            Qt.AlignCenter | Qt.TextWordWrap,
+            str(index.data(Qt.DisplayRole) or ""),
+        )
+        painter.restore()
 SPECIALTIES = [
     "Psicologa",
     "Psicopedagoga",
@@ -2215,6 +2238,7 @@ class BulkAppointmentEditDialog(QDialog):
             ]
             check = QCheckBox()
             check.setCursor(Qt.PointingHandCursor)
+            check.setEnabled(appointment_is_selectable(row))
             check.stateChanged.connect(self.update_selection)
             holder = QWidget()
             holder.setStyleSheet(f"background: {COLORS['surface']};")
@@ -2317,6 +2341,92 @@ class BulkAppointmentEditDialog(QDialog):
             show_error(self, exc)
 
 
+class AppointmentEditDialog(QDialog):
+    def __init__(self, parent: QWidget, repo: SupabaseRepository, profile: dict[str, Any], appointment: dict[str, Any]):
+        super().__init__(parent)
+        self.repo = repo
+        self.profile = profile
+        self.appointment = appointment
+        self.setWindowTitle("Editar atendimento")
+        self.setMinimumWidth(620)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(14)
+        appointment_date = date.fromisoformat(appointment["appointment_date"])
+        self.appointment_date = QDateEdit(QDate(appointment_date.year, appointment_date.month, appointment_date.day))
+        self.appointment_date.setCalendarPopup(True)
+        start_parts = [int(value) for value in appointment["start_time"][:5].split(":")]
+        end_parts = [int(value) for value in appointment["end_time"][:5].split(":")]
+        self.start_time = time_field(*start_parts)
+        self.end_time = time_field(*end_parts)
+        self.consultation_fee = QLineEdit()
+        self.consultation_fee.setPlaceholderText("Ex.: 150,00")
+        financial = repo.appointment_financials(appointment["id"]) or {}
+        if financial.get("consultation_fee") is not None:
+            self.consultation_fee.setText(f"{float(financial['consultation_fee']):.2f}".replace(".", ","))
+        self.status = QComboBox()
+        self.status.addItems(STATUSES)
+        self.status.setCurrentText(appointment["status"])
+        form = QGridLayout()
+        for column, (label, field) in enumerate([
+            ("Data", self.appointment_date), ("Início", self.start_time),
+            ("Fim", self.end_time), ("Valor da consulta", self.consultation_fee),
+        ]):
+            form.addWidget(QLabel(label), 0, column)
+            form.addWidget(field, 1, column)
+        form.addWidget(QLabel("Status"), 2, 0)
+        form.addWidget(self.status, 3, 0, 1, 4)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        delete_btn = button("Excluir atendimento", danger=True)
+        delete_btn.clicked.connect(self.delete_appointment)
+        cancel = button("Cancelar", secondary=True)
+        cancel.clicked.connect(self.reject)
+        save = button("Salvar alterações")
+        save.clicked.connect(self.save_changes)
+        actions.addWidget(delete_btn)
+        actions.addStretch()
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addLayout(actions)
+
+    def save_changes(self) -> None:
+        try:
+            self.repo.parse_consultation_fee(self.consultation_fee.text())
+            self.repo.save_appointment({
+                "patient_id": self.appointment["patient_id"],
+                "professional_id": self.appointment["professional_id"],
+                "appointment_date": self.appointment_date.date().toPython().isoformat(),
+                "start_time": self.start_time.time().toString("HH:mm:ss"),
+                "end_time": self.end_time.time().toString("HH:mm:ss"),
+                "status": self.status.currentText(),
+            }, self.appointment["id"])
+            existing = self.repo.appointment_financials(self.appointment["id"]) or {}
+            self.repo.save_appointment_financials(self.appointment["id"], {
+                "consultation_fee": self.consultation_fee.text(),
+                "payment_status": existing.get("payment_status", "Pendente"),
+                "payment_method": existing.get("payment_method", ""),
+                "financial_notes": existing.get("financial_notes", ""),
+            })
+            self.accept()
+        except Exception as exc:
+            show_error(self, exc)
+
+    def delete_appointment(self) -> None:
+        patient = (self.appointment.get("patients") or {}).get("full_name", "este paciente")
+        answer = QMessageBox.question(
+            self, "Excluir atendimento",
+            f"Deseja excluir o atendimento de {patient}?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            try:
+                self.repo.delete_appointment(self.appointment["id"])
+                self.accept()
+            except Exception as exc:
+                show_error(self, exc)
+
+
 class AppointmentDetailsDialog(QDialog):
     def __init__(self, parent: QWidget, repo: SupabaseRepository, profile: dict[str, Any], appointment: dict[str, Any]):
         super().__init__(parent)
@@ -2370,58 +2480,11 @@ class AppointmentDetailsDialog(QDialog):
         self.status.setEnabled(can(profile, Permission.CHANGE_STATUS))
 
         can_manage = can(profile, Permission.MANAGE_AGENDA)
-        appointment_date = date.fromisoformat(appointment["appointment_date"])
-        self.appointment_date = QDateEdit(QDate(appointment_date.year, appointment_date.month, appointment_date.day))
-        self.appointment_date.setCalendarPopup(True)
-        self.appointment_date.setEnabled(can_manage)
-        start_parts = [int(value) for value in appointment["start_time"][:5].split(":")]
-        end_parts = [int(value) for value in appointment["end_time"][:5].split(":")]
-        self.start_time = time_field(*start_parts)
-        self.end_time = time_field(*end_parts)
-        self.start_time.setEnabled(can_manage)
-        self.end_time.setEnabled(can_manage)
-        self.consultation_fee = QLineEdit()
-        self.consultation_fee.setPlaceholderText("Ex.: 150,00")
-        self.consultation_fee.setEnabled(can_manage)
-        try:
-            financial = repo.appointment_financials(appointment["id"]) or {}
-            fee = financial.get("consultation_fee")
-            if fee is not None:
-                self.consultation_fee.setText(f"{float(fee):.2f}".replace(".", ","))
-        except Exception:
-            pass
-
         is_professional = profile.get("role") == "professional"
-        edit_panel = QWidget()
-        edit_panel_layout = QVBoxLayout(edit_panel)
-        edit_panel_layout.setContentsMargins(0, 0, 0, 0)
-        edit_panel_layout.setSpacing(14)
-        admin_fields = QWidget()
-        edit_grid = QGridLayout(admin_fields)
-        edit_grid.setContentsMargins(0, 0, 0, 0)
-        edit_grid.addWidget(QLabel("Data"), 0, 0)
-        edit_grid.addWidget(self.appointment_date, 1, 0)
-        edit_grid.addWidget(QLabel("Início"), 0, 1)
-        edit_grid.addWidget(self.start_time, 1, 1)
-        edit_grid.addWidget(QLabel("Fim"), 0, 2)
-        edit_grid.addWidget(self.end_time, 1, 2)
-        fee_label = QLabel("Valor da consulta")
-        fee_label.setVisible(can_manage)
-        self.consultation_fee.setVisible(can_manage)
-        edit_grid.addWidget(fee_label, 0, 3)
-        edit_grid.addWidget(self.consultation_fee, 1, 3)
-
-        status_row = QHBoxLayout()
-        status_row.addWidget(QLabel("Status"))
-        status_row.addWidget(self.status, 1)
-        admin_fields.setVisible(not is_professional and can_manage)
-        edit_panel_layout.addWidget(admin_fields)
-        edit_panel_layout.addLayout(status_row)
-        edit_panel.setVisible(can_manage or can(profile, Permission.CHANGE_STATUS))
 
         self.note = QTextEdit()
         self.note.setPlaceholderText("Relatório da sessão")
-        self.note.setMinimumHeight(340)
+        self.note.setMinimumHeight(460)
         try:
             existing = repo.session_note_for(appointment["id"])
             self.note.setPlainText(existing.get("note", "") if existing else "")
@@ -2430,16 +2493,12 @@ class AppointmentDetailsDialog(QDialog):
         self.note.setEnabled(can(profile, Permission.WRITE_SESSION_NOTE))
 
         edit_buttons = QHBoxLayout()
-        if not is_professional and (can_manage or can(profile, Permission.CHANGE_STATUS)):
-            save_changes_button = button("Salvar alterações")
-            save_changes_button.setMinimumWidth(170)
-            save_changes_button.clicked.connect(self.save_appointment_changes)
-            edit_buttons.addWidget(save_changes_button)
+        if profile.get("role") in {"admin", "reception"} and can_manage:
+            edit_button = button("Editar atendimento", secondary=True)
+            edit_button.setMinimumWidth(170)
+            edit_button.clicked.connect(self.open_edit_dialog)
+            edit_buttons.addWidget(edit_button)
         edit_buttons.addStretch()
-        if can(profile, Permission.MANAGE_AGENDA):
-            delete_btn = button("Excluir atendimento", danger=True)
-            delete_btn.clicked.connect(self.delete_appointment)
-            edit_buttons.addWidget(delete_btn)
 
         note_buttons = QHBoxLayout()
         if can(profile, Permission.WRITE_SESSION_NOTE):
@@ -2451,8 +2510,12 @@ class AppointmentDetailsDialog(QDialog):
 
         layout.addWidget(header)
         layout.addWidget(patient_card)
-        layout.addWidget(edit_panel)
         layout.addLayout(edit_buttons)
+        if is_professional and can(profile, Permission.CHANGE_STATUS):
+            professional_status_row = QHBoxLayout()
+            professional_status_row.addWidget(QLabel("Status"))
+            professional_status_row.addWidget(self.status, 1)
+            layout.addLayout(professional_status_row)
         layout.addWidget(QLabel("Relatório da sessão"))
         layout.addWidget(self.note, 1)
         layout.addLayout(note_buttons)
@@ -2463,34 +2526,12 @@ class AppointmentDetailsDialog(QDialog):
         label.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-weight: 600;")
         return label
 
-    def save_appointment_changes(self) -> None:
-        try:
-            if can(self.profile, Permission.MANAGE_AGENDA):
-                self.repo.parse_consultation_fee(self.consultation_fee.text())
-                values = {
-                    "patient_id": self.appointment["patient_id"],
-                    "professional_id": self.appointment["professional_id"],
-                    "appointment_date": self.appointment_date.date().toPython().isoformat(),
-                    "start_time": self.start_time.time().toString("HH:mm:ss"),
-                    "end_time": self.end_time.time().toString("HH:mm:ss"),
-                    "status": self.status.currentText(),
-                }
-                self.repo.save_appointment(values, self.appointment["id"])
-                existing = self.repo.appointment_financials(self.appointment["id"]) or {}
-                self.repo.save_appointment_financials(
-                    self.appointment["id"],
-                    {
-                        "consultation_fee": self.consultation_fee.text(),
-                        "payment_status": existing.get("payment_status", "Pendente"),
-                        "payment_method": existing.get("payment_method", ""),
-                        "financial_notes": existing.get("financial_notes", ""),
-                    },
-                )
-            elif can(self.profile, Permission.CHANGE_STATUS):
-                self.repo.update_appointment_status(self.appointment["id"], self.status.currentText())
+    def open_edit_dialog(self) -> None:
+        if self.profile.get("role") not in {"admin", "reception"} or not can(self.profile, Permission.MANAGE_AGENDA):
+            raise AppError("Você não possui permissão para editar o atendimento.")
+        dialog = AppointmentEditDialog(self, self.repo, self.profile, self.appointment)
+        if dialog.exec():
             self.accept()
-        except Exception as exc:
-            show_error(self, exc)
 
     def save_session_report(self) -> None:
         try:
@@ -2502,26 +2543,6 @@ class AppointmentDetailsDialog(QDialog):
             self.accept()
         except Exception as exc:
             show_error(self, exc)
-
-    def delete_appointment(self) -> None:
-        patient = (self.appointment.get("patients") or {}).get("full_name", "este paciente")
-        date_text = self.appointment.get("appointment_date", "")
-        start_text = self.appointment.get("start_time", "")[:5]
-        answer = QMessageBox.question(
-            self,
-            "Excluir atendimento",
-            f"Deseja excluir o atendimento de {patient} em {date_text} às {start_text}?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            return
-        try:
-            self.repo.delete_appointment(self.appointment["id"])
-            self.accept()
-        except Exception as exc:
-            show_error(self, exc)
-
 
 class FinancePage(QWidget):
     def __init__(self, repo: SupabaseRepository):
@@ -2559,6 +2580,7 @@ class FinancePage(QWidget):
         self.use_date_filter = QCheckBox("Usar período")
         self.use_date_filter.setCursor(Qt.PointingHandCursor)
         self.use_date_filter.setText("Usar período")
+        self.use_date_filter.setVisible(False)
         self.use_date_filter.setMinimumWidth(150)
         self.use_date_filter.setMinimumHeight(44)
         self.use_date_filter.setStyleSheet(
@@ -2594,7 +2616,8 @@ class FinancePage(QWidget):
         self.start_date.setCalendarPopup(True)
         self.start_date.setMinimumWidth(130)
         self.start_date.dateChanged.connect(self.refresh)
-        self.end_date = QDateEdit(today)
+        _, month_end = current_month_period(today.toPython())
+        self.end_date = QDateEdit(QDate(month_end.year, month_end.month, month_end.day))
         self.end_date.setCalendarPopup(True)
         self.end_date.setMinimumWidth(130)
         self.end_date.dateChanged.connect(self.refresh)
@@ -2643,7 +2666,6 @@ class FinancePage(QWidget):
         refresh_btn = button("Atualizar")
         refresh_btn.setMinimumWidth(100)
         refresh_btn.clicked.connect(self.refresh)
-        filters.addWidget(self.use_date_filter, 0, Qt.AlignBottom)
         filters.addLayout(self.filter_field("Início", self.start_date))
         filters.addLayout(self.filter_field("Fim", self.end_date))
         filters.addLayout(self.filter_field("Situação", self.status_filter))
@@ -2670,13 +2692,33 @@ class FinancePage(QWidget):
             ["Paciente", "Atend.", "Total", "Recebido", "Aberto"],
         )
         full_row_table_polish(self.patient_summary_table)
-        self.patient_summary_table.cellDoubleClicked.connect(self.open_patient_financial_tab)
+        self.patient_summary_table.cellDoubleClicked.connect(self.open_patient_receipt_from_summary)
+        self.patient_summary_table.setToolTip("Dê duplo clique em uma linha para registrar um recebimento")
+        self.patient_summary_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.patient_summary_table.verticalHeader().setDefaultSectionSize(40)
+        self.patient_summary_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in range(1, self.patient_summary_table.columnCount()):
+            self.patient_summary_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        patient_action_hint = QLabel("Duplo clique em um paciente para abrir o recebimento")
+        patient_action_hint.setObjectName("Muted")
+        patient_action_hint.setStyleSheet("background: transparent;")
+        patient_summary_panel.layout().insertWidget(1, patient_action_hint)
         self.professional_summary_table, professional_summary_panel = self.summary_table_panel(
             "A pagar por funcionário",
             ["Funcionário", "Atend.", "Bruto", "Repasse 70%", "Pago", "Aberto"],
         )
         full_row_table_polish(self.professional_summary_table)
-        self.professional_summary_table.cellDoubleClicked.connect(self.open_professional_financial_tab)
+        self.professional_summary_table.cellDoubleClicked.connect(self.open_professional_payout_from_summary)
+        self.professional_summary_table.setToolTip("Dê duplo clique em uma linha para registrar um repasse")
+        self.professional_summary_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.professional_summary_table.verticalHeader().setDefaultSectionSize(40)
+        self.professional_summary_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in range(1, self.professional_summary_table.columnCount()):
+            self.professional_summary_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        professional_action_hint = QLabel("Duplo clique em um funcionário para abrir o repasse")
+        professional_action_hint.setObjectName("Muted")
+        professional_action_hint.setStyleSheet("background: transparent;")
+        professional_summary_panel.layout().insertWidget(1, professional_action_hint)
         summary_lists.addWidget(patient_summary_panel, 1)
         summary_lists.addWidget(professional_summary_panel, 1)
         summary_layout.addLayout(summary_lists, 1)
@@ -2757,6 +2799,16 @@ class FinancePage(QWidget):
             ["Data", "Paciente", "Valor", "Forma", "Atendimentos", "Observação"],
         )
         full_row_table_polish(self.receipt_history_table)
+        self.receipt_history_table.cellDoubleClicked.connect(lambda _row, _col: self.edit_history_transaction("receipt"))
+        receipt_history_actions = QHBoxLayout()
+        edit_receipt = button("Editar recebimento", secondary=True)
+        delete_receipt = button("Excluir recebimento", secondary=True)
+        edit_receipt.clicked.connect(lambda: self.edit_history_transaction("receipt"))
+        delete_receipt.clicked.connect(lambda: self.delete_history_transaction("receipt"))
+        receipt_history_actions.addStretch()
+        receipt_history_actions.addWidget(edit_receipt)
+        receipt_history_actions.addWidget(delete_receipt)
+        receipt_history_layout.addLayout(receipt_history_actions)
         receipt_history_layout.addWidget(receipt_history_panel, 1)
         payout_history_page = QWidget()
         payout_history_layout = QVBoxLayout(payout_history_page)
@@ -2766,6 +2818,16 @@ class FinancePage(QWidget):
             ["Data", "Funcionário", "Valor", "Forma", "Atendimentos", "Observação"],
         )
         full_row_table_polish(self.payout_history_table)
+        self.payout_history_table.cellDoubleClicked.connect(lambda _row, _col: self.edit_history_transaction("payout"))
+        payout_history_actions = QHBoxLayout()
+        edit_payout = button("Editar repasse", secondary=True)
+        delete_payout = button("Excluir repasse", secondary=True)
+        edit_payout.clicked.connect(lambda: self.edit_history_transaction("payout"))
+        delete_payout.clicked.connect(lambda: self.delete_history_transaction("payout"))
+        payout_history_actions.addStretch()
+        payout_history_actions.addWidget(edit_payout)
+        payout_history_actions.addWidget(delete_payout)
+        payout_history_layout.addLayout(payout_history_actions)
         payout_history_layout.addWidget(payout_history_panel, 1)
         history_sections.addTab(receipt_history_page, "Recebimentos")
         history_sections.addTab(payout_history_page, "Repasses")
@@ -2773,15 +2835,18 @@ class FinancePage(QWidget):
         history_layout.addWidget(history_sections, 1)
 
         self.tabs.addTab(summary_tab, "Resumo")
+        self.tabs.addTab(history_tab, "Histórico")
         self.tabs.addTab(receipts_tab, "Recebimentos")
         self.tabs.addTab(payouts_tab, "Repasses")
         self.tabs.addTab(appointments_tab, "Atendimentos")
-        self.tabs.addTab(history_tab, "Histórico")
 
         layout.addWidget(title)
         layout.addWidget(filters_panel)
         layout.addWidget(self.tabs, 1)
         self.lookups_loaded = False
+        self.use_date_filter.blockSignals(True)
+        self.use_date_filter.setChecked(True)
+        self.use_date_filter.blockSignals(False)
         self.sync_finance_filters(refresh=False)
 
     def summary_table_panel(self, title: str, headers: list[str]) -> tuple[QTableWidget, QFrame]:
@@ -2813,6 +2878,52 @@ class FinancePage(QWidget):
     def register_payout(self) -> None:
         try:
             dialog = ProfessionalPayoutDialog(self, self.repo, self.money)
+            if dialog.exec():
+                self.repo.save_professional_payout(dialog.values(), dialog.selected_items())
+                QMessageBox.information(self, "Repasse", "Repasse registrado com sucesso.")
+                self.refresh()
+        except Exception as exc:
+            show_error(self, exc)
+
+    def open_patient_receipt_from_summary(self, row: int, _col: int) -> None:
+        item = self.patient_summary_table.item(row, 0)
+        patient_id = item.data(Qt.UserRole) if item else None
+        if not patient_id:
+            return
+        try:
+            dialog = PatientReceiptDialog(
+                self,
+                self.repo,
+                self.money,
+                patient_id=patient_id,
+                professional_id=self.professional_filter.currentData(),
+                start_date=self.start_date.date().toPython(),
+                end_date=self.end_date.date().toPython(),
+                situation=self.status_filter.currentData() or "open",
+            )
+            if dialog.exec():
+                self.repo.save_patient_payment(dialog.values(), dialog.selected_items())
+                QMessageBox.information(self, "Recebimento", "Recebimento registrado com sucesso.")
+                self.refresh()
+        except Exception as exc:
+            show_error(self, exc)
+
+    def open_professional_payout_from_summary(self, row: int, _col: int) -> None:
+        item = self.professional_summary_table.item(row, 0)
+        professional_id = item.data(Qt.UserRole) if item else None
+        if not professional_id:
+            return
+        try:
+            dialog = ProfessionalPayoutDialog(
+                self,
+                self.repo,
+                self.money,
+                professional_id=professional_id,
+                patient_id=self.patient_filter.currentData(),
+                start_date=self.start_date.date().toPython(),
+                end_date=self.end_date.date().toPython(),
+                situation=self.status_filter.currentData() or "open",
+            )
             if dialog.exec():
                 self.repo.save_professional_payout(dialog.values(), dialog.selected_items())
                 QMessageBox.information(self, "Repasse", "Repasse registrado com sucesso.")
@@ -2936,7 +3047,11 @@ class FinancePage(QWidget):
 
     def fill_patient_financial_table(self, table: QTableWidget, badge: QLabel, patient_id: str) -> None:
         try:
-            rows = self.repo.financial_appointments(None, None, patient_id=patient_id)
+            rows = self.repo.financial_appointments(
+                self.start_date.date().toPython(),
+                self.end_date.date().toPython(),
+                patient_id=patient_id,
+            )
             payment_items = self.repo.patient_payment_items_for_appointments([row["id"] for row in rows])
             rows = self.filter_appointment_rows_by_situation(rows, payment_items, "all")
         except Exception as exc:
@@ -3072,18 +3187,22 @@ class FinancePage(QWidget):
 
     def fill_professional_financial_table(self, table: QTableWidget, badge: QLabel, professional_id: str) -> None:
         try:
-            rows = self.repo.financial_appointments(None, None, professional_id=professional_id)
+            rows = self.repo.financial_appointments(
+                self.start_date.date().toPython(),
+                self.end_date.date().toPython(),
+                professional_id=professional_id,
+            )
             payout_items = self.repo.professional_payout_items_for_appointments([row["id"] for row in rows])
         except Exception as exc:
             show_error(self, exc)
             rows = []
             payout_items = []
 
-        paid_by_appointment: dict[str, float] = {}
+        repassed_appointments: set[str] = set()
         for item in payout_items:
             appointment_id = item.get("appointment_id")
-            if appointment_id:
-                paid_by_appointment[appointment_id] = paid_by_appointment.get(appointment_id, 0.0) + float(item.get("amount") or 0)
+            if appointment_id and item.get("is_repassed", True):
+                repassed_appointments.add(appointment_id)
 
         table.professional_id = professional_id
         table.professional_badge = badge
@@ -3095,7 +3214,7 @@ class FinancePage(QWidget):
             financial = self.repo.financial_row(row)
             gross = self.fee_for(row) if self.is_billable(row) else 0.0
             payout = gross * 0.70
-            paid = paid_by_appointment.get(row.get("id"), 0.0)
+            paid = payout if row.get("id") in repassed_appointments else 0.0
             open_amount = max(payout - paid, 0.0)
             values = [
                 row.get("appointment_date", ""),
@@ -3150,9 +3269,8 @@ class FinancePage(QWidget):
         self.patient_filter.blockSignals(False)
 
     def sync_finance_filters(self, refresh: bool = True) -> None:
-        use_period = self.use_date_filter.isChecked()
-        self.start_date.setEnabled(use_period)
-        self.end_date.setEnabled(use_period)
+        self.start_date.setEnabled(True)
+        self.end_date.setEnabled(True)
         if refresh:
             self.refresh()
 
@@ -3162,9 +3280,8 @@ class FinancePage(QWidget):
             self.load_professionals()
             self.lookups_loaded = True
         try:
-            use_period = self.use_date_filter.isChecked()
-            start = self.start_date.date().toPython() if use_period else None
-            end = self.end_date.date().toPython() if use_period else None
+            start = self.start_date.date().toPython()
+            end = self.end_date.date().toPython()
             patient_id = self.patient_filter.currentData()
             professional_id = self.professional_filter.currentData()
             self.rows = self.repo.patient_payment_balance_appointments(
@@ -3255,6 +3372,8 @@ class FinancePage(QWidget):
                 item = QTableWidgetItem(str(value))
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 item.setTextAlignment(Qt.AlignCenter if column != 1 and column != 5 else Qt.AlignLeft | Qt.AlignVCenter)
+                if column == 0:
+                    item.setData(Qt.UserRole, row.get("id"))
                 self.receipt_history_table.setItem(row_index, column, item)
         self.receipt_history_table.resizeColumnsToContents()
         self.receipt_history_table.horizontalHeader().setStretchLastSection(True)
@@ -3279,9 +3398,60 @@ class FinancePage(QWidget):
                 item = QTableWidgetItem(str(value))
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 item.setTextAlignment(Qt.AlignCenter if column != 1 and column != 5 else Qt.AlignLeft | Qt.AlignVCenter)
+                if column == 0:
+                    item.setData(Qt.UserRole, row.get("id"))
                 self.payout_history_table.setItem(row_index, column, item)
         self.payout_history_table.resizeColumnsToContents()
         self.payout_history_table.horizontalHeader().setStretchLastSection(True)
+
+    def selected_history_transaction(self, transaction_type: str) -> dict[str, Any] | None:
+        table = self.receipt_history_table if transaction_type == "receipt" else self.payout_history_table
+        rows = self.receipt_history_rows if transaction_type == "receipt" else self.payout_history_rows
+        row_index = table.currentRow()
+        return rows[row_index] if 0 <= row_index < len(rows) else None
+
+    def edit_history_transaction(self, transaction_type: str) -> None:
+        transaction = self.selected_history_transaction(transaction_type)
+        if not transaction:
+            QMessageBox.information(self, "Histórico", "Selecione uma movimentação para editar.")
+            return
+        dialog = FinancialHistoryEditDialog(self, transaction, transaction_type, self.money_edit_text)
+        if not dialog.exec():
+            return
+        try:
+            if transaction_type == "receipt":
+                self.repo.update_patient_payment(transaction["id"], dialog.values())
+            else:
+                self.repo.update_professional_payout(transaction["id"], dialog.values())
+            QMessageBox.information(self, "Histórico", "Movimentação atualizada com sucesso.")
+            self.refresh()
+        except Exception as exc:
+            show_error(self, exc)
+
+    def delete_history_transaction(self, transaction_type: str) -> None:
+        transaction = self.selected_history_transaction(transaction_type)
+        if not transaction:
+            QMessageBox.information(self, "Histórico", "Selecione uma movimentação para excluir.")
+            return
+        label = "recebimento" if transaction_type == "receipt" else "repasse"
+        answer = QMessageBox.question(
+            self,
+            "Confirmar exclusão",
+            f"Deseja excluir este {label}? Os atendimentos vinculados voltarão a ficar em aberto.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            if transaction_type == "receipt":
+                self.repo.delete_patient_payment(transaction["id"])
+            else:
+                self.repo.delete_professional_payout(transaction["id"])
+            QMessageBox.information(self, "Histórico", "Movimentação excluída com sucesso.")
+            self.refresh()
+        except Exception as exc:
+            show_error(self, exc)
 
     def money(self, value: Any) -> str:
         if value in (None, ""):
@@ -3320,17 +3490,16 @@ class FinancePage(QWidget):
         payment_items: list[dict[str, Any]],
         situation: str,
     ) -> list[dict[str, Any]]:
-        paid_by_appointment: dict[str, float] = {}
+        paid_appointments: set[str] = set()
         for item in payment_items:
             appointment_id = item.get("appointment_id")
-            if not appointment_id:
-                continue
-            paid_by_appointment[appointment_id] = paid_by_appointment.get(appointment_id, 0.0) + float(item.get("amount") or 0)
+            if appointment_id and item.get("is_paid", True):
+                paid_appointments.add(appointment_id)
 
         filtered: list[dict[str, Any]] = []
         for row in rows:
             fee = self.fee_for(row)
-            paid = paid_by_appointment.get(row.get("id"), 0.0)
+            paid = fee if row.get("id") in paid_appointments else 0.0
             open_amount = max(fee - paid, 0)
             row["_paid_amount"] = paid
             row["_open_amount"] = open_amount
@@ -3363,12 +3532,14 @@ class FinancePage(QWidget):
         return (row.get("professionals") or {}).get("full_name", "Funcionário não informado")
 
     def payment_totals_by_appointment(self) -> dict[str, float]:
+        rows_by_id = {row.get("id"): row for row in self.rows if row.get("id")}
         totals: dict[str, float] = {}
         for row in self.patient_payment_item_rows:
             appointment_id = row.get("appointment_id")
-            if not appointment_id:
+            appointment = rows_by_id.get(appointment_id)
+            if not appointment or not row.get("is_paid", True):
                 continue
-            totals[appointment_id] = totals.get(appointment_id, 0.0) + float(row.get("amount") or 0)
+            totals[appointment_id] = self.fee_for(appointment)
         return totals
 
     def payment_totals_by_patient(self) -> dict[str, float]:
@@ -3381,16 +3552,19 @@ class FinancePage(QWidget):
             patient_id = appointment.get("patient_id")
             if not patient_id:
                 continue
-            totals[patient_id] = totals.get(patient_id, 0.0) + float(row.get("amount") or 0)
+            if row.get("is_paid", True):
+                totals[patient_id] = totals.get(patient_id, 0.0) + self.fee_for(appointment)
         return totals
 
     def payout_totals_by_appointment(self) -> dict[str, float]:
+        rows_by_id = {row.get("id"): row for row in self.rows if row.get("id")}
         totals: dict[str, float] = {}
         for row in self.professional_payout_item_rows:
             appointment_id = row.get("appointment_id")
-            if not appointment_id:
+            appointment = rows_by_id.get(appointment_id)
+            if not appointment or not row.get("is_repassed", True):
                 continue
-            totals[appointment_id] = totals.get(appointment_id, 0.0) + float(row.get("amount") or 0)
+            totals[appointment_id] = self.fee_for(appointment) * 0.70
         return totals
 
     def payout_totals_by_professional(self) -> dict[str, float]:
@@ -3403,12 +3577,13 @@ class FinancePage(QWidget):
             professional_id = appointment.get("professional_id")
             if not professional_id:
                 continue
-            totals[professional_id] = totals.get(professional_id, 0.0) + float(row.get("amount") or 0)
+            if row.get("is_repassed", True):
+                totals[professional_id] = totals.get(professional_id, 0.0) + self.fee_for(appointment) * 0.70
         return totals
 
     def payment_totals_by_payment_date(self) -> dict[str, float]:
         totals: dict[str, float] = {}
-        for row in self.patient_payment_rows:
+        for row in self.receipt_history_rows:
             patient_id = row.get("patient_id")
             if not patient_id:
                 continue
@@ -3417,7 +3592,7 @@ class FinancePage(QWidget):
 
     def payout_totals_by_payout_date(self) -> dict[str, float]:
         totals: dict[str, float] = {}
-        for row in self.professional_payout_rows:
+        for row in self.payout_history_rows:
             professional_id = row.get("professional_id")
             if not professional_id:
                 continue
@@ -3427,33 +3602,20 @@ class FinancePage(QWidget):
     def fill_summary(self) -> None:
         clear_layout(self.summary_grid)
         billable_rows = [row for row in self.summary_rows if self.is_billable(row)]
-        billable_ids = {row.get("id") for row in billable_rows}
-        realized = round(sum(self.fee_for(row) for row in billable_rows), 2)
-        future = round(sum(self.fee_for(row) for row in billable_rows if self.is_future(row)), 2)
-        received_for_appointments = round(
-            sum(float(item.get("amount") or 0) for item in self.summary_payment_item_rows if item.get("appointment_id") in billable_ids),
-            2,
-        )
-        patient_open = round(max(realized - received_for_appointments, 0), 2)
-        professional_total = round(sum(self.repo.professional_share(self.fee_for(row)) for row in billable_rows), 2)
-        paid_for_appointments = round(
-            sum(float(item.get("amount") or 0) for item in self.summary_payout_item_rows if item.get("appointment_id") in billable_ids),
-            2,
-        )
-        professional_due = round(max(professional_total - paid_for_appointments, 0), 2)
+        consultation_revenue = round(sum(self.fee_for(row) for row in billable_rows), 2)
         clinic_share = round(sum(round(self.fee_for(row) * 0.30, 2) for row in billable_rows), 2)
-        received_cash = round(sum(float(row.get("amount") or 0) for row in self.patient_payment_rows), 2)
-        paid_cash = round(sum(float(row.get("amount") or 0) for row in self.professional_payout_rows), 2)
-        cash_result = round(received_cash - paid_cash, 2)
+        professional_share = round(
+            sum(self.repo.professional_share(self.fee_for(row)) for row in billable_rows),
+            2,
+        )
+        received_cash = round(sum(float(row.get("amount") or 0) for row in self.receipt_history_rows), 2)
+        paid_cash = round(sum(float(row.get("amount") or 0) for row in self.payout_history_rows), 2)
         cards = [
-            ("Faturado", self.money(realized), COLORS["primary"]),
-            ("Faturamento futuro", self.money(future), COLORS["blue"]),
-            ("Recebido de pacientes", self.money(received_cash), COLORS["green"]),
-            ("A receber", self.money(patient_open), COLORS["red"]),
-            ("A pagar funcionários", self.money(professional_due), COLORS["primary_dark"]),
-            ("Repasses pagos", self.money(paid_cash), COLORS["blue"]),
+            ("Faturamento das consultas", self.money(consultation_revenue), COLORS["primary"]),
+            ("Valor recebido", self.money(received_cash), COLORS["green"]),
             ("Parte da clínica 30%", self.money(clinic_share), COLORS["text"]),
-            ("Resultado em caixa", self.money(cash_result), COLORS["green"] if cash_result >= 0 else COLORS["red"]),
+            ("Total para funcionários 70%", self.money(professional_share), COLORS["primary_dark"]),
+            ("Repassado para funcionários", self.money(paid_cash), COLORS["blue"]),
         ]
         for col, (label, value, color) in enumerate(cards):
             frame = card()
@@ -3468,7 +3630,7 @@ class FinancePage(QWidget):
             text.setStyleSheet("background: transparent; font-weight: 700;")
             box.addWidget(number)
             box.addWidget(text)
-            self.summary_grid.addWidget(frame, col // 4, col % 4)
+            self.summary_grid.addWidget(frame, 0, col)
         self.fill_group_tables()
 
     def fill_group_tables(self) -> None:
@@ -3502,7 +3664,7 @@ class FinancePage(QWidget):
 
     def group_by_patient(self) -> list[dict[str, Any]]:
         grouped: dict[str, dict[str, Any]] = {}
-        payments = self.payment_totals_by_patient()
+        payments = self.payment_totals_by_payment_date()
         for row in self.rows:
             if not self.is_billable(row):
                 continue
@@ -3550,7 +3712,7 @@ class FinancePage(QWidget):
 
     def group_by_professional(self) -> list[dict[str, Any]]:
         grouped: dict[str, dict[str, Any]] = {}
-        payouts = self.payout_totals_by_professional()
+        payouts = self.payout_totals_by_payout_date()
         for row in self.rows:
             if not self.is_billable(row):
                 continue
@@ -3669,6 +3831,53 @@ class FinancePage(QWidget):
         }.get(status, (COLORS["bg2"], COLORS["text"]))
 
 
+class FinancialHistoryEditDialog(QDialog):
+    PAYMENT_METHODS = ["PIX", "Dinheiro", "Crédito", "Débito", "Unimed", "Outro", "Nao informado"]
+
+    def __init__(self, parent: QWidget, transaction: dict[str, Any], transaction_type: str, money_formatter):
+        super().__init__(parent)
+        self.transaction_type = transaction_type
+        is_receipt = transaction_type == "receipt"
+        self.setWindowTitle("Editar recebimento" if is_receipt else "Editar repasse")
+        self.setMinimumWidth(520)
+        layout = QFormLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+        raw_date = transaction.get("payment_date" if is_receipt else "payout_date")
+        try:
+            parsed_date = date.fromisoformat(str(raw_date)[:10])
+        except ValueError:
+            parsed_date = date.today()
+        self.transaction_date = QDateEdit(QDate(parsed_date.year, parsed_date.month, parsed_date.day))
+        self.transaction_date.setCalendarPopup(True)
+        self.transaction_date.setDisplayFormat("dd/MM/yyyy")
+        self.amount = QLineEdit(money_formatter(transaction.get("amount")))
+        self.payment_method = QComboBox()
+        self.payment_method.addItems(self.PAYMENT_METHODS)
+        current_method = self.payment_method.findText(str(transaction.get("payment_method") or "Nao informado"))
+        if current_method >= 0:
+            self.payment_method.setCurrentIndex(current_method)
+        layout.addRow("Data", self.transaction_date)
+        layout.addRow("Valor recebido" if is_receipt else "Valor repassado", self.amount)
+        layout.addRow("Forma de pagamento", self.payment_method)
+        actions = QHBoxLayout()
+        cancel = button("Cancelar", secondary=True)
+        save = button("Salvar alterações")
+        cancel.clicked.connect(self.reject)
+        save.clicked.connect(self.accept)
+        actions.addStretch()
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addRow(actions)
+
+    def values(self) -> dict[str, Any]:
+        return {
+            "date": self.transaction_date.date().toPython().isoformat(),
+            "amount": self.amount.text().strip(),
+            "payment_method": self.payment_method.currentText(),
+        }
+
+
 class FinancialAppointmentDialog(QDialog):
     PAYMENT_STATUSES = [
         ("Não informado", "Nao informado"),
@@ -3777,7 +3986,7 @@ class FinancialAppointmentDialog(QDialog):
         }
 
 
-class PatientReceiptDialog(QDialog):
+class LegacyPatientReceiptDialog(QDialog):
     PAYMENT_METHODS = ["PIX", "Dinheiro", "Crédito", "Débito", "Unimed", "Outro"]
 
     def __init__(self, parent: QWidget, repo: SupabaseRepository, money_formatter):
@@ -4117,7 +4326,7 @@ class PatientReceiptDialog(QDialog):
         }
 
 
-class ProfessionalPayoutDialog(QDialog):
+class LegacyProfessionalPayoutDialog(QDialog):
     PAYMENT_METHODS = ["PIX", "Dinheiro", "Crédito", "Débito", "Unimed", "Outro"]
 
     def __init__(self, parent: QWidget, repo: SupabaseRepository, money_formatter):
@@ -4456,6 +4665,445 @@ class ProfessionalPayoutDialog(QDialog):
             "amount": self.amount.text().strip(),
             "notes": self.notes.toPlainText().strip(),
         }
+
+
+class FinancialTransactionDialog(QDialog):
+    PAYMENT_METHODS = ["PIX", "Dinheiro", "Crédito", "Débito", "Unimed", "Outro"]
+
+    def __init__(
+        self,
+        parent: QWidget,
+        repo: SupabaseRepository,
+        money_formatter,
+        transaction_type: str,
+        *,
+        patient_id: str | None = None,
+        professional_id: str | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        situation: str = "all",
+    ):
+        super().__init__(parent)
+        self.repo = repo
+        self.money = money_formatter
+        self.transaction_type = transaction_type
+        self.rows: list[dict[str, Any]] = []
+        self.row_checks: list[QCheckBox] = []
+        self.updating_checks = False
+        self.selected_total_value = 0.0
+        self.selected_gross_total_value = 0.0
+        self.amount_overridden = False
+        self.initial_patient_id = patient_id
+        self.initial_professional_id = professional_id
+        self.situation = situation
+        is_receipt = transaction_type == "receipt"
+        self.setWindowTitle("Registrar recebimento" if is_receipt else "Registrar repasse")
+        self.setMinimumSize(1180, 760)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(10)
+
+        title = QLabel("Recebimento de paciente" if is_receipt else "Repasse a profissional")
+        title.setObjectName("PageTitle")
+        subtitle = QLabel(
+            "Selecione livremente os atendimentos vinculados a esta operação. "
+            "Atendimentos cancelados permanecem disponíveis e são apenas destacados."
+        )
+        subtitle.setObjectName("Muted")
+        root.addWidget(title)
+        root.addWidget(subtitle)
+
+        filters = page_card()
+        filter_layout = QGridLayout(filters)
+        filter_layout.setContentsMargins(14, 10, 14, 10)
+        filter_layout.setHorizontalSpacing(10)
+        filter_layout.setVerticalSpacing(4)
+        self.subject = QComboBox()
+        self.subject.setMinimumWidth(260)
+        self.counterpart = QComboBox()
+        self.counterpart.setMinimumWidth(230)
+        period_start, period_end = current_month_period()
+        period_start = start_date or period_start
+        period_end = end_date or period_end
+        self.period_start = QDateEdit(QDate(period_start.year, period_start.month, period_start.day))
+        self.period_end = QDateEdit(QDate(period_end.year, period_end.month, period_end.day))
+        for field in (self.period_start, self.period_end):
+            field.setCalendarPopup(True)
+            field.setDisplayFormat("dd/MM/yyyy")
+        search = button("Buscar", secondary=True)
+        search.clicked.connect(self.load_appointments)
+        filter_fields = [
+            ("Paciente" if is_receipt else "Profissional", self.subject),
+            ("Profissional" if is_receipt else "Paciente", self.counterpart),
+            ("Data inicial", self.period_start),
+            ("Data final", self.period_end),
+        ]
+        for column, (label, widget) in enumerate(filter_fields):
+            field_label = QLabel(label)
+            field_label.setStyleSheet("background: transparent;")
+            filter_layout.addWidget(field_label, 0, column)
+            filter_layout.addWidget(widget, 1, column)
+        filter_layout.addWidget(search, 1, len(filter_fields))
+        filter_layout.setColumnStretch(0, 2)
+        root.addWidget(filters)
+
+        table_panel = page_card()
+        table_layout = QVBoxLayout(table_panel)
+        table_layout.setContentsMargins(14, 10, 14, 10)
+        table_layout.setSpacing(8)
+        table_header = QHBoxLayout()
+        table_title = QLabel("Atendimentos do período")
+        table_title.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-size: 16px; font-weight: 800;")
+        self.result_label = QLabel("0 atendimento(s)")
+        self.result_label.setObjectName("Muted")
+        table_header.addWidget(table_title)
+        table_header.addStretch()
+        table_header.addWidget(self.result_label)
+        headers = (
+            ["Receber", "Data", "Horário", "Paciente", "Profissional", "Status", "Valor original", "Forma registrada", "Já registrado"]
+            if is_receipt
+            else ["Repassar", "Data", "Horário", "Profissional", "Paciente", "Status", "Valor original", "Repasse ref.", "Já repassado"]
+        )
+        self.table = QTableWidget(0, len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        table_polish(self.table)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.setItemDelegate(FinancialRowDelegate(self.table))
+        self.table.verticalHeader().setDefaultSectionSize(44)
+        self.table.setMinimumHeight(44 * 6 + 38)
+        self.table.setFocusPolicy(Qt.NoFocus)
+        check_icon = resource_path("check_white.svg").as_posix()
+        self.table.setStyleSheet(
+            self.table.styleSheet()
+            + f"""
+            QTableWidget::item {{ border: none; border-radius: 0; padding: 0 6px; }}
+            QCheckBox::indicator {{ width: 21px; height: 21px; border-radius: 5px; border: 2px solid {COLORS['primary']}; background: #FFFFFF; }}
+            QCheckBox::indicator:checked {{ background: {COLORS['primary']}; border: 2px solid {COLORS['primary']}; image: url("{check_icon}"); }}
+            """
+        )
+        table_layout.addLayout(table_header)
+        table_layout.addWidget(self.table, 1)
+        root.addWidget(table_panel, 1)
+
+        footer = page_card()
+        footer_layout = QGridLayout(footer)
+        footer_layout.setContentsMargins(14, 10, 14, 10)
+        footer_layout.setHorizontalSpacing(10)
+        footer_layout.setVerticalSpacing(5)
+        self.transaction_date = QDateEdit(QDate.currentDate())
+        self.transaction_date.setCalendarPopup(True)
+        self.transaction_date.setDisplayFormat("dd/MM/yyyy")
+        self.transaction_date.setFixedWidth(170)
+        self.reference_total = QLineEdit("0,00")
+        self.reference_total.setReadOnly(True)
+        self.reference_total.setFixedWidth(220)
+        self.reference_total.setCursor(Qt.ArrowCursor)
+        self.reference_total.setToolTip("Calculado automaticamente pelos atendimentos selecionados")
+        self.reference_total.setStyleSheet(
+            f"background: #F4F1ED; color: {COLORS['muted']}; border: 1px dashed {COLORS['line']};"
+        )
+        self.professional_share_total = None
+        if not is_receipt:
+            self.professional_share_total = QLineEdit("0,00")
+            self.professional_share_total.setReadOnly(True)
+            self.professional_share_total.setFixedWidth(220)
+            self.professional_share_total.setCursor(Qt.ArrowCursor)
+            self.professional_share_total.setToolTip("70% do valor total dos atendimentos selecionados")
+            self.professional_share_total.setStyleSheet(
+                f"background: #F4F1ED; color: {COLORS['muted']}; border: 1px dashed {COLORS['line']};"
+            )
+        self.amount = QLineEdit("0,00")
+        self.amount.setFixedWidth(220)
+        editable_style = f"background: #FFFFFF; color: {COLORS['text']};"
+        self.amount.setStyleSheet(editable_style)
+        self.amount.setPlaceholderText("Valor efetivamente recebido" if is_receipt else "Valor efetivamente repassado")
+        self.amount.textEdited.connect(self.mark_amount_overridden)
+
+        self.payment_method = QComboBox()
+        self.payment_method.setFixedWidth(220)
+        self.payment_method.addItems(self.PAYMENT_METHODS)
+
+        fields = [
+            ("Data do recebimento" if is_receipt else "Data do repasse", self.transaction_date),
+            ("Valor total", self.reference_total),
+        ]
+        if self.professional_share_total is not None:
+            fields.append(("Parte do funcionário 70%", self.professional_share_total))
+        fields.extend([
+            ("Valor cobrado / recebido" if is_receipt else "Valor repassado", self.amount),
+            ("Forma de pagamento", self.payment_method),
+        ])
+        for column, (label, widget) in enumerate(fields):
+            field_label = QLabel(label)
+            field_label.setStyleSheet("background: transparent;")
+            footer_layout.addWidget(field_label, 0, column)
+            footer_layout.addWidget(widget, 1, column)
+        footer_layout.setColumnStretch(len(fields), 1)
+        root.addWidget(footer)
+
+        actions = QHBoxLayout()
+        cancel = button("Cancelar", secondary=True)
+        cancel.clicked.connect(self.reject)
+        save = button("Salvar recebimento" if is_receipt else "Salvar repasse")
+        save.clicked.connect(self.accept)
+        actions.addStretch()
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        root.addLayout(actions)
+
+        self.load_subjects()
+        self.subject.currentIndexChanged.connect(self.load_appointments)
+        self.counterpart.currentIndexChanged.connect(self.load_appointments)
+        self.load_appointments()
+
+    def load_subjects(self) -> None:
+        self.subject.clear()
+        self.counterpart.clear()
+        try:
+            patients = self.repo.patients(active_only=False)
+            professionals = self.repo.professionals(active_only=False)
+        except Exception:
+            patients = []
+            professionals = []
+        primary_rows = patients if self.transaction_type == "receipt" else professionals
+        counterpart_rows = professionals if self.transaction_type == "receipt" else patients
+        self.subject.addItem("Todos os pacientes" if self.transaction_type == "receipt" else "Todos os profissionais", None)
+        self.counterpart.addItem("Todos os profissionais" if self.transaction_type == "receipt" else "Todos os pacientes", None)
+        for row in primary_rows:
+            self.subject.addItem(row.get("full_name", ""), row.get("id"))
+        for row in counterpart_rows:
+            self.counterpart.addItem(row.get("full_name", ""), row.get("id"))
+        primary_id = self.initial_patient_id if self.transaction_type == "receipt" else self.initial_professional_id
+        counterpart_id = self.initial_professional_id if self.transaction_type == "receipt" else self.initial_patient_id
+        primary_index = self.subject.findData(primary_id)
+        counterpart_index = self.counterpart.findData(counterpart_id)
+        if primary_index >= 0:
+            self.subject.setCurrentIndex(primary_index)
+        if counterpart_index >= 0:
+            self.counterpart.setCurrentIndex(counterpart_index)
+
+    def load_appointments(self) -> None:
+        subject_id = self.subject.currentData()
+        counterpart_id = self.counterpart.currentData()
+        start = self.period_start.date().toPython()
+        end = self.period_end.date().toPython()
+        if start > end:
+            QMessageBox.warning(self, "Período inválido", "A data final deve ser maior ou igual à data inicial.")
+            return
+        try:
+            if self.transaction_type == "receipt":
+                self.rows = self.repo.patient_receipt_appointments(
+                    subject_id, start, end, None, counterpart_id
+                )
+            else:
+                self.rows = self.repo.professional_payout_appointments(
+                    subject_id, start, end, None, counterpart_id
+                )
+            if self.situation == "open":
+                flag = "_is_paid" if self.transaction_type == "receipt" else "_is_repassed"
+                self.rows = [row for row in self.rows if not row.get(flag)]
+            elif self.situation == "closed":
+                flag = "_is_paid" if self.transaction_type == "receipt" else "_is_repassed"
+                self.rows = [row for row in self.rows if row.get(flag)]
+        except Exception as exc:
+            show_error(self, exc)
+            self.rows = []
+        self.fill_table()
+
+    def fill_table(self) -> None:
+        self.updating_checks = True
+        self.row_checks = []
+        self.table.clearContents()
+        self.table.setRowCount(len(self.rows))
+        for row_index, row in enumerate(self.rows):
+            financial = self.repo.financial_row(row)
+            cancelled = row.get("status") == "Cancelado"
+            check = QCheckBox()
+            check.setCursor(Qt.PointingHandCursor)
+            check.setEnabled(appointment_is_selectable(row))
+            check.setChecked(True)
+            check.stateChanged.connect(
+                lambda _state=0, index=row_index: self.update_selected_total(index)
+            )
+            holder = QWidget()
+            holder.setStyleSheet(f"background: {'#FFF1F2' if cancelled else COLORS['surface']};")
+            holder_layout = QHBoxLayout(holder)
+            holder_layout.setContentsMargins(0, 0, 0, 0)
+            holder_layout.setAlignment(Qt.AlignCenter)
+            holder_layout.addWidget(check)
+            self.table.setCellWidget(row_index, 0, holder)
+            self.row_checks.append(check)
+
+            appointment_date = row.get("appointment_date", "")
+            try:
+                appointment_date = date.fromisoformat(str(appointment_date)[:10]).strftime("%d/%m/%Y")
+            except ValueError:
+                pass
+            if self.transaction_type == "receipt":
+                values = [
+                    appointment_date,
+                    f"{row.get('start_time', '')[:5]} às {row.get('end_time', '')[:5]}",
+                    (row.get("patients") or {}).get("full_name", ""),
+                    (row.get("professionals") or {}).get("full_name", ""),
+                    row.get("status", "Não informado"),
+                    self.money(financial.get("consultation_fee")),
+                    financial.get("payment_method") or "—",
+                    "Pago" if row.get("_is_paid") else "Em aberto",
+                ]
+            else:
+                values = [
+                    appointment_date,
+                    f"{row.get('start_time', '')[:5]} às {row.get('end_time', '')[:5]}",
+                    (row.get("professionals") or {}).get("full_name", ""),
+                    (row.get("patients") or {}).get("full_name", ""),
+                    row.get("status", "Não informado"),
+                    self.money(row.get("_gross_amount")),
+                    self.money(row.get("_payout_amount")),
+                    "Repassado" if row.get("_is_repassed") else "Em aberto",
+                ]
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem(str(value or ""))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setData(FINANCIAL_ROW_SELECTED_ROLE, True)
+                if cancelled and column == 5:
+                    item.setForeground(QColor(COLORS["red"]))
+                self.table.setItem(row_index, column, item)
+            self.table.setRowHeight(row_index, 44)
+        widths = [75, 105, 115, 180, 180, 125, 125, 125, 120]
+        for column in range(self.table.columnCount()):
+            self.table.setColumnWidth(column, widths[column])
+        self.updating_checks = False
+        self.result_label.setText(f"{len(self.rows)} atendimento(s)")
+        self.update_selected_total()
+
+    def selected_indexes(self) -> list[int]:
+        return [index for index, check in enumerate(self.row_checks) if check.isChecked()]
+
+    def row_reference_amount(self, row_index: int) -> float:
+        row = self.rows[row_index]
+        if self.transaction_type == "receipt":
+            return round(float(self.repo.financial_row(row).get("consultation_fee") or 0), 2)
+        return round(float(row.get("_payout_amount") or 0), 2)
+
+    def row_gross_amount(self, row_index: int) -> float:
+        row = self.rows[row_index]
+        if self.transaction_type == "receipt":
+            return self.row_reference_amount(row_index)
+        return round(float(row.get("_gross_amount") or 0), 2)
+
+    def selected_total(self) -> float:
+        return round(self.selected_total_value, 2)
+
+    def update_selected_total(self, changed_row: int | None = None) -> None:
+        if self.updating_checks:
+            return
+        if changed_row is None:
+            self.selected_total_value = round(
+                sum(
+                    self.row_reference_amount(index)
+                    for index, check in enumerate(self.row_checks)
+                    if check.isChecked()
+                ),
+                2,
+            )
+            self.selected_gross_total_value = round(
+                sum(
+                    self.row_gross_amount(index)
+                    for index, check in enumerate(self.row_checks)
+                    if check.isChecked()
+                ),
+                2,
+            )
+            rows_to_update = range(len(self.row_checks))
+        else:
+            check = self.row_checks[changed_row]
+            delta = self.row_reference_amount(changed_row)
+            gross_delta = self.row_gross_amount(changed_row)
+            self.selected_total_value = round(
+                self.selected_total_value + (delta if check.isChecked() else -delta),
+                2,
+            )
+            self.selected_gross_total_value = round(
+                self.selected_gross_total_value + (gross_delta if check.isChecked() else -gross_delta),
+                2,
+            )
+            rows_to_update = (changed_row,)
+        for row_index in rows_to_update:
+            check = self.row_checks[row_index]
+            checked = check.isChecked()
+            holder = self.table.cellWidget(row_index, 0)
+            cancelled = self.rows[row_index].get("status") == "Cancelado"
+            background = COLORS["primary_soft"] if checked else "#FFF1F2" if cancelled else COLORS["surface"]
+            if holder:
+                holder.setStyleSheet(f"background: {background};")
+            for column in range(1, self.table.columnCount()):
+                item = self.table.item(row_index, column)
+                if item:
+                    item.setData(FINANCIAL_ROW_SELECTED_ROLE, checked)
+        total = self.selected_total_value
+        displayed_total = self.selected_gross_total_value if self.transaction_type == "payout" else total
+        self.reference_total.setText(self.money(displayed_total).replace("R$ ", ""))
+        if self.professional_share_total is not None:
+            self.professional_share_total.setText(self.money(total).replace("R$ ", ""))
+        self.update_suggested_amount()
+
+    def input_amount(self, field: QLineEdit) -> float:
+        text = field.text().strip().replace("R$", "").replace(" ", "")
+        if not text:
+            return 0.0
+        if "," in text:
+            text = text.replace(".", "").replace(",", ".")
+        try:
+            return max(float(text), 0.0)
+        except ValueError:
+            return 0.0
+
+    def mark_amount_overridden(self) -> None:
+        self.amount_overridden = True
+
+    def update_suggested_amount(self) -> None:
+        if self.amount_overridden:
+            return
+        suggestion = self.selected_total()
+        self.amount.setText(f"{suggestion:.2f}".replace(".", ","))
+
+    def selected_items(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "appointment_id": self.rows[index]["id"],
+                "patient_id": self.rows[index].get("patient_id"),
+                "professional_id": self.rows[index].get("professional_id"),
+            }
+            for index in self.selected_indexes()
+        ]
+
+    def values(self) -> dict[str, Any]:
+        values = {
+            "payment_method": self.payment_method.currentText() or "Nao informado",
+            "amount": self.amount.text().strip(),
+            "discount": "0,00",
+            "surcharge": "0,00",
+            "notes": "",
+        }
+        if self.transaction_type == "receipt":
+            values.update({"patient_id": self.subject.currentData(), "payment_date": self.transaction_date.date().toPython().isoformat()})
+        else:
+            values.update({"professional_id": self.subject.currentData(), "payout_date": self.transaction_date.date().toPython().isoformat()})
+        return values
+
+
+class PatientReceiptDialog(FinancialTransactionDialog):
+    def __init__(self, parent: QWidget, repo: SupabaseRepository, money_formatter, **filters):
+        super().__init__(parent, repo, money_formatter, "receipt", **filters)
+
+
+class ProfessionalPayoutDialog(FinancialTransactionDialog):
+    def __init__(self, parent: QWidget, repo: SupabaseRepository, money_formatter, **filters):
+        super().__init__(parent, repo, money_formatter, "payout", **filters)
 
 
 class DocumentUploadDialog(QDialog):

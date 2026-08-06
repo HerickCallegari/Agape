@@ -788,11 +788,11 @@ class SupabaseRepository:
             query = query.lte("appointment_date", end_date.isoformat())
         rows = query.execute().data or []
         appointment_ids = [row["id"] for row in rows]
-        paid_by_appointment = {appointment_id: 0.0 for appointment_id in appointment_ids}
+        paid_appointment_ids: set[str] = set()
         if appointment_ids:
             for item in self.patient_payment_items_for_appointments(appointment_ids):
-                appointment_id = item.get("appointment_id")
-                paid_by_appointment[appointment_id] = paid_by_appointment.get(appointment_id, 0.0) + float(item.get("amount") or 0)
+                if item.get("appointment_id") and item.get("is_paid", True):
+                    paid_appointment_ids.add(item["appointment_id"])
 
         balance_rows = []
         for row in rows:
@@ -806,8 +806,9 @@ class SupabaseRepository:
             fee = round(float(financial.get("consultation_fee") or 0), 2)
             if not include_non_chargeable and fee <= 0:
                 continue
-            paid = paid_by_appointment.get(row["id"], 0.0)
-            open_amount = round(max(fee - paid, 0), 2) if chargeable and fee > 0 else 0.0
+            is_paid = row["id"] in paid_appointment_ids or financial.get("payment_status") == "Pago"
+            paid = fee if is_paid else 0.0
+            open_amount = 0.0 if is_paid else round(fee, 2) if chargeable and fee > 0 else 0.0
             is_open = open_amount > 0.009
             if balance_filter == "open" and not is_open:
                 continue
@@ -815,6 +816,7 @@ class SupabaseRepository:
                 continue
             row["_paid_amount"] = paid
             row["_open_amount"] = open_amount
+            row["_is_paid"] = is_paid
             balance_rows.append(row)
         return balance_rows
 
@@ -854,7 +856,7 @@ class SupabaseRepository:
     ) -> list[dict[str, Any]]:
         query = (
             self.client.table("patient_payments")
-            .select("*, patients(full_name), patient_payment_items(amount, appointments(patient_id, professional_id))")
+            .select("*, patients(full_name), patient_payment_items(appointment_id, is_paid, appointments(patient_id, professional_id))")
             .order("payment_date", desc=True)
             .order("created_at", desc=True)
         )
@@ -875,6 +877,17 @@ class SupabaseRepository:
             ]
         return rows
 
+    def update_patient_payment(self, payment_id: str, values: dict[str, Any]) -> None:
+        self.client.rpc("update_patient_payment", {
+            "p_payment_id": payment_id,
+            "p_payment_date": values.get("date"),
+            "p_amount": self.parse_money(values.get("amount"), "valor recebido"),
+            "p_payment_method": str(values.get("payment_method") or "Nao informado"),
+        }).execute()
+
+    def delete_patient_payment(self, payment_id: str) -> None:
+        self.client.rpc("delete_patient_payment", {"p_payment_id": payment_id}).execute()
+
     def patient_payment_items_for_appointments(self, appointment_ids: list[str]) -> list[dict[str, Any]]:
         if not appointment_ids:
             return []
@@ -882,7 +895,7 @@ class SupabaseRepository:
         for batch in self._batched_ids(appointment_ids):
             rows.extend(
                 self.client.table("patient_payment_items")
-                .select("appointment_id, amount")
+                .select("appointment_id, amount, is_paid")
                 .in_("appointment_id", batch)
                 .execute()
                 .data
@@ -901,22 +914,31 @@ class SupabaseRepository:
             balance_filter="open",
         )
 
-    def patient_open_payment_appointments(self, patient_id: str) -> list[dict[str, Any]]:
+    def patient_receipt_appointments(
+        self,
+        patient_id: str | None,
+        start_date: date,
+        end_date: date,
+        payment_method: str | None = None,
+        professional_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         rows = self.patient_payment_balance_appointments(
             patient_id=patient_id,
+            professional_id=professional_id,
+            start_date=start_date,
+            end_date=end_date,
             balance_filter="all",
             include_non_chargeable=True,
         )
-        visible_rows = []
-        for row in rows:
-            financial = self.financial_row(row)
-            payment_status = str(financial.get("payment_status") or "").strip()
-            fee = float(financial.get("consultation_fee") or 0)
-            open_amount = float(row.get("_open_amount") or 0)
-            is_paid = payment_status == "Pago" or (fee > 0 and open_amount <= 0.009)
-            if not is_paid:
-                visible_rows.append(row)
-        return visible_rows
+        if payment_method:
+            rows = [
+                row for row in rows
+                if str(self.financial_row(row).get("payment_method") or "") == payment_method
+            ]
+        return rows
+
+    def patient_open_payment_appointments(self, patient_id: str) -> list[dict[str, Any]]:
+        return self.patient_receipt_appointments(patient_id, date.min, date.max)
 
     def parse_money(self, value: Any, field_label: str = "valor") -> float:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -934,6 +956,23 @@ class SupabaseRepository:
         if amount <= 0:
             raise AppError(f"O {field_label} deve ser maior que zero.")
         return amount
+
+    def parse_nonnegative_money(self, value: Any, field_label: str) -> float:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return 0.0
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            amount = float(value)
+        else:
+            text = str(value).strip().replace("R$", "").replace(" ", "")
+            if "," in text:
+                text = text.replace(".", "").replace(",", ".")
+            try:
+                amount = float(text)
+            except ValueError as exc:
+                raise AppError(f"Informe um {field_label} válido.") from exc
+        if amount < 0:
+            raise AppError(f"O {field_label} não pode ser negativo.")
+        return round(amount, 2)
 
     def parse_consultation_fee(self, value: Any) -> float | None:
         if value is None or (isinstance(value, str) and not value.strip()):
@@ -956,8 +995,11 @@ class SupabaseRepository:
         if self.profile is None:
             raise AppError("Usuário sem perfil ativo.")
         patient_id = values.get("patient_id")
+        selected_patient_ids = {item.get("patient_id") for item in items if item.get("patient_id")}
+        if not patient_id and len(selected_patient_ids) == 1:
+            patient_id = selected_patient_ids.pop()
         if not patient_id:
-            raise AppError("Escolha um paciente.")
+            raise AppError("Selecione atendimentos de um único paciente para registrar o recebimento.")
         if not items:
             raise AppError("Selecione pelo menos um atendimento para receber.")
         current_rows = self.patient_payment_balance_appointments(
@@ -967,14 +1009,14 @@ class SupabaseRepository:
         validated_items = []
         for item in items:
             row = current_by_id.get(item.get("appointment_id"))
-            open_amount = round(float((row or {}).get("_open_amount") or 0), 2)
-            if not row or open_amount <= 0:
-                raise AppError("Um atendimento selecionado não pertence ao paciente ou não possui saldo para receber.")
-            validated_items.append({"appointment_id": row["id"], "open_amount": open_amount})
+            if not row:
+                raise AppError("Um atendimento selecionado não pertence ao paciente.")
+            reference_amount = round(float(self.financial_row(row).get("consultation_fee") or 0), 2)
+            validated_items.append({"appointment_id": row["id"], "reference_amount": reference_amount})
         amount = self.parse_money(values.get("amount"), "valor recebido")
-        selected_total = round(sum(item["open_amount"] for item in validated_items), 2)
-        if amount > selected_total + 0.009:
-            raise AppError("O valor recebido não pode ser maior que o saldo dos atendimentos selecionados.")
+        discount = self.parse_nonnegative_money(values.get("discount"), "desconto")
+        surcharge = self.parse_nonnegative_money(values.get("surcharge"), "acréscimo")
+        reference_amount = round(sum(item["reference_amount"] for item in validated_items), 2)
 
         self.client.rpc(
             "register_patient_payment",
@@ -982,6 +1024,9 @@ class SupabaseRepository:
                 "p_patient_id": patient_id,
                 "p_payment_date": values.get("payment_date"),
                 "p_amount": round(amount, 2),
+                "p_reference_amount": reference_amount,
+                "p_discount_amount": discount,
+                "p_surcharge_amount": surcharge,
                 "p_payment_method": values.get("payment_method") or "Nao informado",
                 "p_notes": values.get("notes", "").strip(),
                 "p_appointment_ids": [item["appointment_id"] for item in validated_items],
@@ -1012,7 +1057,7 @@ class SupabaseRepository:
     ) -> list[dict[str, Any]]:
         query = (
             self.client.table("professional_payouts")
-            .select("*, professionals(full_name), professional_payout_items(amount, appointments(patient_id, professional_id))")
+            .select("*, professionals(full_name), professional_payout_items(appointment_id, is_repassed, appointments(patient_id, professional_id))")
             .order("payout_date", desc=True)
             .order("created_at", desc=True)
         )
@@ -1040,7 +1085,7 @@ class SupabaseRepository:
         for batch in self._batched_ids(appointment_ids):
             rows.extend(
                 self.client.table("professional_payout_items")
-                .select("appointment_id, amount")
+                .select("appointment_id, amount, is_repassed")
                 .in_("appointment_id", batch)
                 .execute()
                 .data
@@ -1048,63 +1093,93 @@ class SupabaseRepository:
             )
         return rows
 
-    def professional_open_payout_appointments(self, professional_id: str) -> list[dict[str, Any]]:
-        rows = (
+    def update_professional_payout(self, payout_id: str, values: dict[str, Any]) -> None:
+        self.client.rpc("update_professional_payout", {
+            "p_payout_id": payout_id,
+            "p_payout_date": values.get("date"),
+            "p_amount": self.parse_money(values.get("amount"), "valor repassado"),
+            "p_payment_method": str(values.get("payment_method") or "Nao informado"),
+        }).execute()
+
+    def delete_professional_payout(self, payout_id: str) -> None:
+        self.client.rpc("delete_professional_payout", {"p_payout_id": payout_id}).execute()
+
+    def professional_payout_appointments(
+        self,
+        professional_id: str | None,
+        start_date: date,
+        end_date: date,
+        payment_method: str | None = None,
+        patient_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = (
             self.client.table("appointments")
-            .select("*, patients(full_name), appointment_financials(*)")
-            .eq("professional_id", professional_id)
+            .select("*, patients(full_name), professionals(full_name), appointment_financials(*)")
+            .gte("appointment_date", start_date.isoformat())
+            .lte("appointment_date", end_date.isoformat())
             .order("appointment_date")
             .order("start_time")
-            .execute()
-            .data
-            or []
         )
+        if professional_id:
+            query = query.eq("professional_id", professional_id)
+        if patient_id:
+            query = query.eq("patient_id", patient_id)
+        rows = query.execute().data or []
+        if payment_method:
+            rows = [
+                row for row in rows
+                if str(self.financial_row(row).get("payment_method") or "") == payment_method
+            ]
         appointment_ids = [row["id"] for row in rows]
-        paid_by_appointment = {appointment_id: 0.0 for appointment_id in appointment_ids}
+        repassed_appointment_ids: set[str] = set()
         if appointment_ids:
             for item in self.professional_payout_items_for_appointments(appointment_ids):
-                appointment_id = item.get("appointment_id")
-                paid_by_appointment[appointment_id] = paid_by_appointment.get(appointment_id, 0.0) + float(item.get("amount") or 0)
+                if item.get("appointment_id") and item.get("is_repassed", True):
+                    repassed_appointment_ids.add(item["appointment_id"])
         open_rows = []
         for row in rows:
             financial = self.financial_row(row)
-            chargeable = (
-                row.get("status") not in self.NON_CHARGEABLE_APPOINTMENT_STATUSES
-                and financial.get("payment_status") not in self.NON_CHARGEABLE_FINANCIAL_STATUSES
-            )
             fee = round(float(financial.get("consultation_fee") or 0), 2)
-            payout_amount = round(fee * 0.70, 2) if chargeable else 0.0
-            paid = paid_by_appointment.get(row["id"], 0.0)
-            open_amount = round(max(payout_amount - paid, 0), 2)
-            row["_gross_amount"] = fee if chargeable else 0.0
+            payout_amount = round(fee * 0.70, 2)
+            is_repassed = row["id"] in repassed_appointment_ids or financial.get("professional_payout_status") == "Repassado"
+            paid = payout_amount if is_repassed else 0.0
+            open_amount = 0.0 if is_repassed else payout_amount
+            row["_gross_amount"] = fee
             row["_payout_amount"] = payout_amount
             row["_paid_payout_amount"] = round(paid, 2)
             row["_open_payout_amount"] = open_amount
-            row["_is_chargeable"] = chargeable
+            row["_is_chargeable"] = True
+            row["_is_repassed"] = is_repassed
             open_rows.append(row)
         return open_rows
+
+    def professional_open_payout_appointments(self, professional_id: str) -> list[dict[str, Any]]:
+        return self.professional_payout_appointments(professional_id, date.min, date.max)
 
     def save_professional_payout(self, values: dict[str, Any], items: list[dict[str, Any]]) -> None:
         if self.profile is None:
             raise AppError("Usuário sem perfil ativo.")
         professional_id = values.get("professional_id")
+        selected_professional_ids = {item.get("professional_id") for item in items if item.get("professional_id")}
+        if not professional_id and len(selected_professional_ids) == 1:
+            professional_id = selected_professional_ids.pop()
         if not professional_id:
-            raise AppError("Escolha um funcionário.")
+            raise AppError("Selecione atendimentos de um único profissional para registrar o repasse.")
         if not items:
             raise AppError("Selecione pelo menos um atendimento para repassar.")
-        current_rows = self.professional_open_payout_appointments(professional_id)
+        current_rows = self.professional_payout_appointments(professional_id, date.min, date.max)
         current_by_id = {row["id"]: row for row in current_rows}
         validated_items = []
         for item in items:
             row = current_by_id.get(item.get("appointment_id"))
-            open_amount = round(float((row or {}).get("_open_payout_amount") or 0), 2)
-            if not row or open_amount <= 0:
-                raise AppError("Um atendimento selecionado não pertence ao profissional ou não possui saldo para repassar.")
-            validated_items.append({"appointment_id": row["id"], "open_amount": open_amount})
+            if not row:
+                raise AppError("Um atendimento selecionado não pertence ao profissional.")
+            reference_amount = round(float((row or {}).get("_payout_amount") or 0), 2)
+            validated_items.append({"appointment_id": row["id"], "reference_amount": reference_amount})
         amount = self.parse_money(values.get("amount"), "valor do repasse")
-        selected_total = round(sum(item["open_amount"] for item in validated_items), 2)
-        if amount > selected_total + 0.009:
-            raise AppError("O valor do repasse não pode ser maior que o saldo dos atendimentos selecionados.")
+        discount = self.parse_nonnegative_money(values.get("discount"), "desconto")
+        surcharge = self.parse_nonnegative_money(values.get("surcharge"), "acréscimo")
+        reference_amount = round(sum(item["reference_amount"] for item in validated_items), 2)
 
         self.client.rpc(
             "register_professional_payout",
@@ -1112,6 +1187,9 @@ class SupabaseRepository:
                 "p_professional_id": professional_id,
                 "p_payout_date": values.get("payout_date"),
                 "p_amount": round(amount, 2),
+                "p_reference_amount": reference_amount,
+                "p_discount_amount": discount,
+                "p_surcharge_amount": surcharge,
                 "p_payment_method": values.get("payment_method") or "Nao informado",
                 "p_notes": values.get("notes", "").strip(),
                 "p_appointment_ids": [item["appointment_id"] for item in validated_items],
