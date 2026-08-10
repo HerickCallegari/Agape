@@ -2623,9 +2623,9 @@ class FinancePage(QWidget):
         self.end_date.dateChanged.connect(self.refresh)
         self.status_filter = QComboBox()
         self.status_filter.setMinimumWidth(140)
+        self.status_filter.addItem("Todos", "all")
         self.status_filter.addItem("Abertos", "open")
         self.status_filter.addItem("Fechados", "closed")
-        self.status_filter.addItem("Todos", "all")
         self.status_filter.currentIndexChanged.connect(self.refresh)
         self.patient_filter = QComboBox()
         self.patient_filter.setMinimumWidth(170)
@@ -2688,8 +2688,8 @@ class FinancePage(QWidget):
         summary_lists = QHBoxLayout()
         summary_lists.setSpacing(10)
         self.patient_summary_table, patient_summary_panel = self.summary_table_panel(
-            "A receber por paciente",
-            ["Paciente", "Atend.", "Total", "Recebido", "Aberto"],
+            "Agendas por paciente",
+            ["Paciente", "Agendas"],
         )
         full_row_table_polish(self.patient_summary_table)
         self.patient_summary_table.cellDoubleClicked.connect(self.open_patient_receipt_from_summary)
@@ -2704,8 +2704,8 @@ class FinancePage(QWidget):
         patient_action_hint.setStyleSheet("background: transparent;")
         patient_summary_panel.layout().insertWidget(1, patient_action_hint)
         self.professional_summary_table, professional_summary_panel = self.summary_table_panel(
-            "A pagar por funcionário",
-            ["Funcionário", "Atend.", "Bruto", "Repasse 70%", "Pago", "Aberto"],
+            "Agendas por funcionário",
+            ["Funcionário", "Agendas"],
         )
         full_row_table_polish(self.professional_summary_table)
         self.professional_summary_table.cellDoubleClicked.connect(self.open_professional_payout_from_summary)
@@ -2899,7 +2899,7 @@ class FinancePage(QWidget):
                 professional_id=self.professional_filter.currentData(),
                 start_date=self.start_date.date().toPython(),
                 end_date=self.end_date.date().toPython(),
-                situation=self.status_filter.currentData() or "open",
+                situation="all",
             )
             if dialog.exec():
                 self.repo.save_patient_payment(dialog.values(), dialog.selected_items())
@@ -2922,7 +2922,7 @@ class FinancePage(QWidget):
                 patient_id=self.patient_filter.currentData(),
                 start_date=self.start_date.date().toPython(),
                 end_date=self.end_date.date().toPython(),
-                situation=self.status_filter.currentData() or "open",
+                situation="all",
             )
             if dialog.exec():
                 self.repo.save_professional_payout(dialog.values(), dialog.selected_items())
@@ -3415,14 +3415,35 @@ class FinancePage(QWidget):
         if not transaction:
             QMessageBox.information(self, "Histórico", "Selecione uma movimentação para editar.")
             return
-        dialog = FinancialHistoryEditDialog(self, transaction, transaction_type, self.money_edit_text)
+        item_key = "patient_payment_items" if transaction_type == "receipt" else "professional_payout_items"
+        linked_dates = []
+        for item in transaction.get(item_key) or []:
+            raw_date = (item.get("appointments") or {}).get("appointment_date")
+            try:
+                linked_dates.append(date.fromisoformat(str(raw_date)[:10]))
+            except ValueError:
+                pass
+        start = min([self.start_date.date().toPython(), *linked_dates])
+        end = max([self.end_date.date().toPython(), *linked_dates])
+        if transaction_type == "receipt":
+            dialog = PatientReceiptDialog(
+                self, self.repo, self.money,
+                patient_id=transaction.get("patient_id"), start_date=start, end_date=end,
+                situation="all", transaction=transaction,
+            )
+        else:
+            dialog = ProfessionalPayoutDialog(
+                self, self.repo, self.money,
+                professional_id=transaction.get("professional_id"), start_date=start, end_date=end,
+                situation="all", transaction=transaction,
+            )
         if not dialog.exec():
             return
         try:
             if transaction_type == "receipt":
-                self.repo.update_patient_payment(transaction["id"], dialog.values())
+                self.repo.update_patient_payment(transaction["id"], dialog.values(), dialog.selected_items())
             else:
-                self.repo.update_professional_payout(transaction["id"], dialog.values())
+                self.repo.update_professional_payout(transaction["id"], dialog.values(), dialog.selected_items())
             QMessageBox.information(self, "Histórico", "Movimentação atualizada com sucesso.")
             self.refresh()
         except Exception as exc:
@@ -3601,21 +3622,13 @@ class FinancePage(QWidget):
 
     def fill_summary(self) -> None:
         clear_layout(self.summary_grid)
-        billable_rows = [row for row in self.summary_rows if self.is_billable(row)]
-        consultation_revenue = round(sum(self.fee_for(row) for row in billable_rows), 2)
-        clinic_share = round(sum(round(self.fee_for(row) * 0.30, 2) for row in billable_rows), 2)
-        professional_share = round(
-            sum(self.repo.professional_share(self.fee_for(row)) for row in billable_rows),
-            2,
-        )
         received_cash = round(sum(float(row.get("amount") or 0) for row in self.receipt_history_rows), 2)
         paid_cash = round(sum(float(row.get("amount") or 0) for row in self.payout_history_rows), 2)
+        appointment_count = len(self.appointment_rows)
         cards = [
-            ("Faturamento das consultas", self.money(consultation_revenue), COLORS["primary"]),
             ("Valor recebido", self.money(received_cash), COLORS["green"]),
-            ("Parte da clínica 30%", self.money(clinic_share), COLORS["text"]),
-            ("Total para funcionários 70%", self.money(professional_share), COLORS["primary_dark"]),
             ("Repassado para funcionários", self.money(paid_cash), COLORS["blue"]),
+            ("Quantidade de agendas", str(appointment_count), COLORS["primary"]),
         ]
         for col, (label, value, color) in enumerate(cards):
             frame = card()
@@ -3640,8 +3653,7 @@ class FinancePage(QWidget):
         self.fill_plain_table(
             self.patient_summary_table,
             patient_rows,
-            ["name", "count", "total", "received", "open"],
-            money_keys={"total", "received", "open"},
+            ["name", "count"],
         )
         self.fill_plain_table(
             self.receipts_table,
@@ -3652,8 +3664,7 @@ class FinancePage(QWidget):
         self.fill_plain_table(
             self.professional_summary_table,
             professional_rows,
-            ["name", "count", "gross", "total_payout", "paid", "open"],
-            money_keys={"gross", "total_payout", "paid", "open"},
+            ["name", "count"],
         )
         self.fill_plain_table(
             self.payouts_table,
@@ -3663,11 +3674,17 @@ class FinancePage(QWidget):
         )
 
     def group_by_patient(self) -> list[dict[str, Any]]:
-        grouped: dict[str, dict[str, Any]] = {}
+        selected_patient_id = self.patient_filter.currentData()
+        grouped: dict[str, dict[str, Any]] = {
+            patient["id"]: {
+                "id": patient["id"], "name": patient.get("full_name", "Paciente não informado"),
+                "count": 0, "total": 0.0, "received": 0.0, "open": 0.0,
+            }
+            for patient in self.patients
+            if patient.get("id") and (not selected_patient_id or patient.get("id") == selected_patient_id)
+        }
         payments = self.payment_totals_by_payment_date()
-        for row in self.rows:
-            if not self.is_billable(row):
-                continue
+        for row in self.appointment_rows:
             patient_id = row.get("patient_id") or self.patient_name_for(row)
             item = grouped.setdefault(
                 patient_id,
@@ -3681,13 +3698,13 @@ class FinancePage(QWidget):
                 },
             )
             fee = self.fee_for(row)
+            item["name"] = self.patient_name_for(row)
             item["count"] += 1
             item["total"] += fee
-        for item in grouped.values():
-            patient_id = next((key for key, value in grouped.items() if value is item), "")
+        for patient_id, item in grouped.items():
             item["received"] = payments.get(patient_id, 0.0)
             item["open"] = max(item["total"] - item["received"], 0)
-        return sorted(grouped.values(), key=lambda item: item["open"], reverse=True)
+        return sorted(grouped.values(), key=lambda item: item["name"].casefold())
 
     def group_open_receipts_by_patient(self) -> list[dict[str, Any]]:
         grouped: dict[str, dict[str, Any]] = {}
@@ -3711,11 +3728,20 @@ class FinancePage(QWidget):
         return sorted(grouped.values(), key=lambda item: item["open"], reverse=True)
 
     def group_by_professional(self) -> list[dict[str, Any]]:
-        grouped: dict[str, dict[str, Any]] = {}
+        selected_professional_id = self.professional_filter.currentData()
+        grouped: dict[str, dict[str, Any]] = {
+            professional["id"]: {
+                "id": professional["id"], "name": professional.get("full_name", "Funcionário não informado"),
+                "count": 0, "gross": 0.0, "percent": "70%", "total_payout": 0.0,
+                "paid": 0.0, "open": 0.0,
+            }
+            for professional in self.professionals
+            if professional.get("id") and (
+                not selected_professional_id or professional.get("id") == selected_professional_id
+            )
+        }
         payouts = self.payout_totals_by_payout_date()
-        for row in self.rows:
-            if not self.is_billable(row):
-                continue
+        for row in self.appointment_rows:
             professional_id = row.get("professional_id") or self.professional_name_for(row)
             item = grouped.setdefault(
                 professional_id,
@@ -3731,13 +3757,14 @@ class FinancePage(QWidget):
                 },
             )
             fee = self.fee_for(row)
+            item["name"] = self.professional_name_for(row)
             item["count"] += 1
             item["gross"] += fee
             item["total_payout"] = round(item["total_payout"] + self.repo.professional_share(fee), 2)
         for professional_id, item in grouped.items():
             item["paid"] = payouts.get(professional_id, 0.0)
             item["open"] = max(item["total_payout"] - item["paid"], 0)
-        return sorted(grouped.values(), key=lambda item: item["open"], reverse=True)
+        return sorted(grouped.values(), key=lambda item: item["name"].casefold())
 
     def fill_plain_table(
         self,
@@ -4682,6 +4709,7 @@ class FinancialTransactionDialog(QDialog):
         start_date: date | None = None,
         end_date: date | None = None,
         situation: str = "all",
+        transaction: dict[str, Any] | None = None,
     ):
         super().__init__(parent)
         self.repo = repo
@@ -4696,8 +4724,16 @@ class FinancialTransactionDialog(QDialog):
         self.initial_patient_id = patient_id
         self.initial_professional_id = professional_id
         self.situation = situation
+        self.edit_transaction = transaction
+        item_key = "patient_payment_items" if transaction_type == "receipt" else "professional_payout_items"
+        self.initial_selected_ids = {
+            item.get("appointment_id") for item in (transaction or {}).get(item_key, []) if item.get("appointment_id")
+        }
         is_receipt = transaction_type == "receipt"
-        self.setWindowTitle("Registrar recebimento" if is_receipt else "Registrar repasse")
+        self.setWindowTitle(
+            ("Editar recebimento" if is_receipt else "Editar repasse")
+            if transaction else ("Registrar recebimento" if is_receipt else "Registrar repasse")
+        )
         self.setMinimumSize(1180, 760)
 
         root = QVBoxLayout(self)
@@ -4793,7 +4829,12 @@ class FinancialTransactionDialog(QDialog):
         footer_layout.setContentsMargins(14, 10, 14, 10)
         footer_layout.setHorizontalSpacing(10)
         footer_layout.setVerticalSpacing(5)
-        self.transaction_date = QDateEdit(QDate.currentDate())
+        transaction_date_value = (transaction or {}).get("payment_date" if is_receipt else "payout_date")
+        try:
+            parsed_transaction_date = date.fromisoformat(str(transaction_date_value)[:10])
+        except ValueError:
+            parsed_transaction_date = date.today()
+        self.transaction_date = QDateEdit(QDate(parsed_transaction_date.year, parsed_transaction_date.month, parsed_transaction_date.day))
         self.transaction_date.setCalendarPopup(True)
         self.transaction_date.setDisplayFormat("dd/MM/yyyy")
         self.transaction_date.setFixedWidth(170)
@@ -4825,6 +4866,12 @@ class FinancialTransactionDialog(QDialog):
         self.payment_method = QComboBox()
         self.payment_method.setFixedWidth(220)
         self.payment_method.addItems(self.PAYMENT_METHODS)
+        if transaction:
+            self.amount.setText(self.money(transaction.get("amount")).replace("R$ ", ""))
+            self.amount_overridden = True
+            method_index = self.payment_method.findText(str(transaction.get("payment_method") or ""))
+            if method_index >= 0:
+                self.payment_method.setCurrentIndex(method_index)
 
         fields = [
             ("Data do recebimento" if is_receipt else "Data do repasse", self.transaction_date),
@@ -4847,7 +4894,9 @@ class FinancialTransactionDialog(QDialog):
         actions = QHBoxLayout()
         cancel = button("Cancelar", secondary=True)
         cancel.clicked.connect(self.reject)
-        save = button("Salvar recebimento" if is_receipt else "Salvar repasse")
+        save = button(
+            "Salvar alterações" if transaction else "Salvar recebimento" if is_receipt else "Salvar repasse"
+        )
         save.clicked.connect(self.accept)
         actions.addStretch()
         actions.addWidget(cancel)
@@ -4855,6 +4904,8 @@ class FinancialTransactionDialog(QDialog):
         root.addLayout(actions)
 
         self.load_subjects()
+        if self.edit_transaction:
+            self.subject.setEnabled(False)
         self.subject.currentIndexChanged.connect(self.load_appointments)
         self.counterpart.currentIndexChanged.connect(self.load_appointments)
         self.load_appointments()
@@ -4924,7 +4975,7 @@ class FinancialTransactionDialog(QDialog):
             check = QCheckBox()
             check.setCursor(Qt.PointingHandCursor)
             check.setEnabled(appointment_is_selectable(row))
-            check.setChecked(True)
+            check.setChecked(row.get("id") in self.initial_selected_ids if self.edit_transaction else True)
             check.stateChanged.connect(
                 lambda _state=0, index=row_index: self.update_selected_total(index)
             )

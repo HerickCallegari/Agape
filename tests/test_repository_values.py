@@ -305,14 +305,16 @@ class AtomicFinancialTransactionTests(unittest.TestCase):
     def test_financial_transactions_are_updated_through_rpc(self):
         self.repo.update_patient_payment("payment-1", {
             "date": "2026-08-06", "amount": "950,00", "payment_method": "PIX"
-        })
+        }, [{"appointment_id": "appointment-1"}])
         self.repo.update_professional_payout("payout-1", {
             "date": "2026-08-06", "amount": "700,00", "payment_method": "Dinheiro"
-        })
+        }, [{"appointment_id": "appointment-2"}])
         self.assertEqual(self.repo.client.rpc_calls[0][0], "update_patient_payment")
         self.assertEqual(self.repo.client.rpc_calls[0][1]["p_amount"], 950.0)
+        self.assertEqual(self.repo.client.rpc_calls[0][1]["p_appointment_ids"], ["appointment-1"])
         self.assertEqual(self.repo.client.rpc_calls[1][0], "update_professional_payout")
         self.assertEqual(self.repo.client.rpc_calls[1][1]["p_amount"], 700.0)
+        self.assertEqual(self.repo.client.rpc_calls[1][1]["p_appointment_ids"], ["appointment-2"])
 
     def test_financial_transactions_are_deleted_through_rpc(self):
         self.repo.delete_patient_payment("payment-1")

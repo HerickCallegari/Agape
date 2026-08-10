@@ -856,7 +856,7 @@ class SupabaseRepository:
     ) -> list[dict[str, Any]]:
         query = (
             self.client.table("patient_payments")
-            .select("*, patients(full_name), patient_payment_items(appointment_id, is_paid, appointments(patient_id, professional_id))")
+            .select("*, patients(full_name), patient_payment_items(appointment_id, is_paid, appointments(patient_id, professional_id, appointment_date))")
             .order("payment_date", desc=True)
             .order("created_at", desc=True)
         )
@@ -877,12 +877,15 @@ class SupabaseRepository:
             ]
         return rows
 
-    def update_patient_payment(self, payment_id: str, values: dict[str, Any]) -> None:
+    def update_patient_payment(self, payment_id: str, values: dict[str, Any], items: list[dict[str, Any]]) -> None:
+        if not items:
+            raise AppError("Selecione pelo menos um atendimento para o recebimento.")
         self.client.rpc("update_patient_payment", {
             "p_payment_id": payment_id,
-            "p_payment_date": values.get("date"),
+            "p_payment_date": values.get("payment_date") or values.get("date"),
             "p_amount": self.parse_money(values.get("amount"), "valor recebido"),
             "p_payment_method": str(values.get("payment_method") or "Nao informado"),
+            "p_appointment_ids": [item["appointment_id"] for item in items],
         }).execute()
 
     def delete_patient_payment(self, payment_id: str) -> None:
@@ -1057,7 +1060,7 @@ class SupabaseRepository:
     ) -> list[dict[str, Any]]:
         query = (
             self.client.table("professional_payouts")
-            .select("*, professionals(full_name), professional_payout_items(appointment_id, is_repassed, appointments(patient_id, professional_id))")
+            .select("*, professionals(full_name), professional_payout_items(appointment_id, is_repassed, appointments(patient_id, professional_id, appointment_date))")
             .order("payout_date", desc=True)
             .order("created_at", desc=True)
         )
@@ -1093,12 +1096,15 @@ class SupabaseRepository:
             )
         return rows
 
-    def update_professional_payout(self, payout_id: str, values: dict[str, Any]) -> None:
+    def update_professional_payout(self, payout_id: str, values: dict[str, Any], items: list[dict[str, Any]]) -> None:
+        if not items:
+            raise AppError("Selecione pelo menos um atendimento para o repasse.")
         self.client.rpc("update_professional_payout", {
             "p_payout_id": payout_id,
-            "p_payout_date": values.get("date"),
+            "p_payout_date": values.get("payout_date") or values.get("date"),
             "p_amount": self.parse_money(values.get("amount"), "valor repassado"),
             "p_payment_method": str(values.get("payment_method") or "Nao informado"),
+            "p_appointment_ids": [item["appointment_id"] for item in items],
         }).execute()
 
     def delete_professional_payout(self, payout_id: str) -> None:
