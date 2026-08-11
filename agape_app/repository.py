@@ -711,6 +711,14 @@ class SupabaseRepository:
             raise AppError("Atendimento não encontrado para exclusão.")
         self.client.table("appointments").delete().eq("id", appointment_id).execute()
 
+    def delete_appointments_bulk(self, appointment_ids: list[str]) -> int:
+        unique_ids = list(dict.fromkeys(appointment_id for appointment_id in appointment_ids if appointment_id))
+        deleted_count = 0
+        for batch in self._batched_ids(unique_ids):
+            result = self.client.table("appointments").delete().in_("id", batch).execute()
+            deleted_count += len(result.data or batch)
+        return deleted_count
+
     def session_note_for(self, appointment_id: str) -> dict[str, Any] | None:
         rows = self.client.table("session_notes").select("*").eq("appointment_id", appointment_id).execute().data or []
         return rows[0] if rows else None
@@ -856,7 +864,7 @@ class SupabaseRepository:
     ) -> list[dict[str, Any]]:
         query = (
             self.client.table("patient_payments")
-            .select("*, patients(full_name), patient_payment_items(appointment_id, is_paid, appointments(patient_id, professional_id, appointment_date))")
+            .select("*, patients(full_name), professionals(full_name), patient_payment_items(appointment_id, is_paid, appointments(patient_id, professional_id, appointment_date))")
             .order("payment_date", desc=True)
             .order("created_at", desc=True)
         )
@@ -886,6 +894,9 @@ class SupabaseRepository:
             "p_amount": self.parse_money(values.get("amount"), "valor recebido"),
             "p_payment_method": str(values.get("payment_method") or "Nao informado"),
             "p_appointment_ids": [item["appointment_id"] for item in items],
+            "p_professional_id": values.get("professional_id"),
+            "p_payout_percentage": int(values.get("payout_percentage") or 0),
+            "p_is_repassed": bool(values.get("is_repassed")),
         }).execute()
 
     def delete_patient_payment(self, payment_id: str) -> None:
@@ -1005,6 +1016,12 @@ class SupabaseRepository:
             raise AppError("Selecione atendimentos de um único paciente para registrar o recebimento.")
         if not items:
             raise AppError("Selecione pelo menos um atendimento para receber.")
+        professional_id = values.get("professional_id")
+        selected_professional_ids = {item.get("professional_id") for item in items if item.get("professional_id")}
+        if not professional_id and len(selected_professional_ids) == 1:
+            professional_id = selected_professional_ids.pop()
+        if not professional_id:
+            raise AppError("Selecione atendimentos de um único profissional para registrar o recebimento.")
         current_rows = self.patient_payment_balance_appointments(
             patient_id=patient_id, balance_filter="all", include_non_chargeable=True
         )
@@ -1014,6 +1031,8 @@ class SupabaseRepository:
             row = current_by_id.get(item.get("appointment_id"))
             if not row:
                 raise AppError("Um atendimento selecionado não pertence ao paciente.")
+            if row.get("professional_id") != professional_id:
+                raise AppError("Todos os atendimentos devem pertencer ao profissional selecionado.")
             reference_amount = round(float(self.financial_row(row).get("consultation_fee") or 0), 2)
             validated_items.append({"appointment_id": row["id"], "reference_amount": reference_amount})
         amount = self.parse_money(values.get("amount"), "valor recebido")
@@ -1025,6 +1044,7 @@ class SupabaseRepository:
             "register_patient_payment",
             {
                 "p_patient_id": patient_id,
+                "p_professional_id": professional_id,
                 "p_payment_date": values.get("payment_date"),
                 "p_amount": round(amount, 2),
                 "p_reference_amount": reference_amount,
@@ -1033,6 +1053,8 @@ class SupabaseRepository:
                 "p_payment_method": values.get("payment_method") or "Nao informado",
                 "p_notes": values.get("notes", "").strip(),
                 "p_appointment_ids": [item["appointment_id"] for item in validated_items],
+                "p_payout_percentage": int(values.get("payout_percentage") or 0),
+                "p_is_repassed": bool(values.get("is_repassed")),
             },
         ).execute()
 

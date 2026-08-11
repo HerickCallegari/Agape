@@ -234,18 +234,22 @@ class AtomicFinancialTransactionTests(unittest.TestCase):
 
     def test_patient_payment_is_sent_as_one_atomic_rpc_with_history_fields(self):
         rows = [
-            {"id": "appointment-july", "appointment_financials": {"consultation_fee": 100}},
-            {"id": "appointment-august", "appointment_financials": {"consultation_fee": 150}},
+            {"id": "appointment-july", "professional_id": "professional-1", "appointment_financials": {"consultation_fee": 100}},
+            {"id": "appointment-august", "professional_id": "professional-1", "appointment_financials": {"consultation_fee": 150}},
         ]
         self.repo.patient_payment_balance_appointments = lambda **_kwargs: rows
 
         self.repo.save_patient_payment(
             {
                 "patient_id": "patient-1", "payment_date": "2026-08-06",
+                "professional_id": "professional-1", "payout_percentage": 65, "is_repassed": True,
                 "amount": "230,00", "discount": "30,00", "surcharge": "10,00",
                 "payment_method": "PIX", "notes": "Meses diferentes",
             },
-            [{"appointment_id": "appointment-july"}, {"appointment_id": "appointment-august"}],
+            [
+                {"appointment_id": "appointment-july", "professional_id": "professional-1"},
+                {"appointment_id": "appointment-august", "professional_id": "professional-1"},
+            ],
         )
 
         self.assertEqual(len(self.repo.client.rpc_calls), 1)
@@ -255,6 +259,9 @@ class AtomicFinancialTransactionTests(unittest.TestCase):
         self.assertEqual(payload["p_discount_amount"], 30.0)
         self.assertEqual(payload["p_surcharge_amount"], 10.0)
         self.assertEqual(payload["p_appointment_ids"], ["appointment-july", "appointment-august"])
+        self.assertEqual(payload["p_professional_id"], "professional-1")
+        self.assertEqual(payload["p_payout_percentage"], 65)
+        self.assertTrue(payload["p_is_repassed"])
         self.assertNotIn("p_item_amounts", payload)
 
     def test_patient_and_professional_filters_can_be_combined(self):
