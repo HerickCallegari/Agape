@@ -518,6 +518,9 @@ class SupabaseRepository:
             .select("*, patients(full_name, guardian_name, guardian_phone, reason_for_care, general_notes), professionals(full_name, profile_id)")
             .eq("appointment_date", selected_date.isoformat())
             .order("start_time")
+            .order("end_time")
+            .order("professional_id")
+            .order("id")
         )
         if professional_id:
             query = query.eq("professional_id", professional_id)

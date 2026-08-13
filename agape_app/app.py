@@ -58,6 +58,13 @@ STATUSES = ["Agendado", "Confirmado", "Atendido", "Falta com aviso", "Falta sem 
 FINANCIAL_ROW_SELECTED_ROLE = Qt.UserRole + 20
 
 
+class AgendaStatusComboBox(QComboBox):
+    """Evita mudanças acidentais de status ao rolar a agenda."""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
 class FinancialRowDelegate(QStyledItemDelegate):
     """Paint checkbox-selected rows consistently without using table selection."""
 
@@ -1844,11 +1851,12 @@ class AgendaPage(QWidget):
         details.addWidget(professional_label)
 
         if can(self.profile, Permission.CHANGE_STATUS):
-            status = QComboBox()
+            status = AgendaStatusComboBox()
             status.addItems(STATUSES)
             status.setCurrentText(row["status"])
             status.setCursor(Qt.PointingHandCursor)
             status.setMinimumWidth(164)
+            status.status_marker = marker
             status.setStyleSheet(
                 f"QComboBox {{ background: {bg}; color: {fg}; border: 1px solid {border_color}; "
                 "border-radius: 8px; padding: 7px 28px 7px 10px; font-weight: 800; }}"
@@ -1856,7 +1864,9 @@ class AgendaPage(QWidget):
                 f"QComboBox QAbstractItemView {{ background: {COLORS['surface']}; color: {COLORS['text']}; "
                 f"selection-background-color: {COLORS['primary_soft']}; selection-color: {COLORS['primary']}; }}"
             )
-            status.currentTextChanged.connect(lambda value, appointment_id=row["id"]: self.change_status(appointment_id, value))
+            status.currentTextChanged.connect(
+                lambda value, appointment=row, combo=status: self.change_status(appointment, combo, value)
+            )
         else:
             status = QLabel(row["status"])
             status.setAlignment(Qt.AlignCenter)
@@ -1871,12 +1881,51 @@ class AgendaPage(QWidget):
         layout.addWidget(status)
         return frame
 
-    def change_status(self, appointment_id: str, status: str) -> None:
+    def change_status(self, appointment: dict[str, Any], combo: QComboBox, status: str) -> None:
+        previous_status = appointment.get("status", "")
+        if not status or status == previous_status:
+            return
+        combo.setEnabled(False)
         try:
-            self.repo.update_appointment_status(appointment_id, status)
-            self.refresh()
+            self.repo.update_appointment_status(appointment["id"], status)
+            appointment["status"] = status
+            self.update_day_summary()
+            QTimer.singleShot(0, lambda: self.apply_status_style(combo, status))
         except Exception as exc:
+            combo.blockSignals(True)
+            combo.setCurrentText(previous_status)
+            combo.blockSignals(False)
+            self.apply_status_style(combo, previous_status)
             show_error(self, exc)
+        finally:
+            combo.setEnabled(True)
+
+    def apply_status_style(self, combo: QComboBox, status: str) -> None:
+        bg, fg = STATUS_COLORS.get(status, ("#FFFFFF", COLORS["text"]))
+        border_color = fg if fg != COLORS["text"] else COLORS["primary"]
+        marker = getattr(combo, "status_marker", None)
+        if marker is not None:
+            marker.setStyleSheet(f"background: {border_color}; border-radius: 2px;")
+        combo.setStyleSheet(
+            f"QComboBox {{ background: {bg}; color: {fg}; border: 1px solid {border_color}; "
+            "border-radius: 8px; padding: 7px 28px 7px 10px; font-weight: 800; }}"
+            "QComboBox::drop-down { border: none; width: 24px; }"
+            f"QComboBox QAbstractItemView {{ background: {COLORS['surface']}; color: {COLORS['text']}; "
+            f"selection-background-color: {COLORS['primary_soft']}; selection-color: {COLORS['primary']}; }}"
+        )
+
+    def update_day_summary(self) -> None:
+        confirmed = sum(1 for row in self.rows if row.get("status") == "Confirmado")
+        completed = sum(1 for row in self.rows if row.get("status") == "Atendido")
+        pending = sum(1 for row in self.rows if row.get("status") not in {"Atendido", "Cancelado"})
+        self.summary_badge.setText(
+            f"{len(self.rows)} total  |  {confirmed} confirmados  |  "
+            f"{completed} atendidos  |  {pending} pendentes"
+        )
+        self.day_stat_labels["total"].setText(str(len(self.rows)))
+        self.day_stat_labels["confirmed"].setText(str(confirmed))
+        self.day_stat_labels["completed"].setText(str(completed))
+        self.day_stat_labels["pending"].setText(str(pending))
 
     def selected_row(self) -> dict[str, Any] | None:
         item = self.list.currentItem()
