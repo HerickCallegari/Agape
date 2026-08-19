@@ -651,6 +651,8 @@ class MainWindow(QMainWindow):
         label, page = self.pages[index]
         if label not in {"Início", "Agenda"} or not hasattr(page, "refresh"):
             return
+        if label == "Agenda" and page.list.verticalScrollBar().isSliderDown():
+            return
         self.safe_refresh_page(page, show_popup=False)
 
 
@@ -1770,6 +1772,12 @@ class AgendaPage(QWidget):
         self.professional_filter.blockSignals(False)
 
     def refresh(self) -> None:
+        scroll_bar = self.list.verticalScrollBar()
+        previous_scroll_value = scroll_bar.value()
+        was_at_bottom = (
+            scroll_bar.maximum() > scroll_bar.minimum()
+            and previous_scroll_value >= scroll_bar.maximum() - 2
+        )
         if not self.professionals_loaded:
             self.load_professionals()
         selected = self.date_edit.date().toPython()
@@ -1792,19 +1800,94 @@ class AgendaPage(QWidget):
         self.day_stat_labels["confirmed"].setText(str(confirmed))
         self.day_stat_labels["completed"].setText(str(completed))
         self.day_stat_labels["pending"].setText(str(pending))
-        self.list.clear()
+        self.reconcile_appointment_list()
+        QTimer.singleShot(
+            0,
+            lambda: scroll_bar.setValue(
+                scroll_bar.maximum() if was_at_bottom else min(previous_scroll_value, scroll_bar.maximum())
+            ),
+        )
+
+    def reconcile_appointment_list(self) -> None:
         if not self.rows:
+            if self.list.count() == 1 and self.list.item(0).data(Qt.UserRole) is None:
+                return
+            self.list.clear()
             empty = QListWidgetItem()
             empty.setSizeHint(QSize(10, 150))
             self.list.addItem(empty)
             self.list.setItemWidget(empty, self.empty_agenda_card())
             return
+
+        desired_ids = [row.get("id") for row in self.rows]
+        if any(appointment_id is None for appointment_id in desired_ids) or len(set(desired_ids)) != len(desired_ids):
+            self.rebuild_appointment_list()
+            return
+
+        desired_id_set = set(desired_ids)
+        existing_items: dict[Any, QListWidgetItem] = {}
+        obsolete_rows: list[int] = []
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            appointment = item.data(Qt.UserRole)
+            appointment_id = appointment.get("id") if isinstance(appointment, dict) else None
+            if appointment_id not in desired_id_set or appointment_id in existing_items:
+                obsolete_rows.append(index)
+            else:
+                existing_items[appointment_id] = item
+
+        for index in reversed(obsolete_rows):
+            self.remove_appointment_item(index)
+
         for row in self.rows:
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, row)
-            item.setSizeHint(QSize(10, 96))
-            self.list.addItem(item)
-            self.list.setItemWidget(item, self.appointment_card(row))
+            appointment_id = row["id"]
+            item = existing_items.get(appointment_id)
+            if item is None:
+                item = self.add_appointment_item(row)
+                existing_items[appointment_id] = item
+            elif item.data(Qt.UserRole) != row:
+                self.update_appointment_item(item, row)
+
+        for target_index, appointment_id in enumerate(desired_ids):
+            item = existing_items[appointment_id]
+            current_index = self.list.row(item)
+            if current_index == target_index:
+                continue
+            widget = self.list.itemWidget(item)
+            self.list.removeItemWidget(item)
+            moved_item = self.list.takeItem(current_index)
+            self.list.insertItem(target_index, moved_item)
+            self.list.setItemWidget(moved_item, widget)
+
+    def rebuild_appointment_list(self) -> None:
+        self.list.clear()
+        for row in self.rows:
+            self.add_appointment_item(row)
+
+    def add_appointment_item(self, row: dict[str, Any]) -> QListWidgetItem:
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, row)
+        item.setSizeHint(QSize(10, 96))
+        self.list.addItem(item)
+        self.list.setItemWidget(item, self.appointment_card(row))
+        return item
+
+    def update_appointment_item(self, item: QListWidgetItem, row: dict[str, Any]) -> None:
+        old_widget = self.list.itemWidget(item)
+        self.list.removeItemWidget(item)
+        if old_widget is not None:
+            old_widget.deleteLater()
+        item.setData(Qt.UserRole, row)
+        item.setSizeHint(QSize(10, 96))
+        self.list.setItemWidget(item, self.appointment_card(row))
+
+    def remove_appointment_item(self, index: int) -> None:
+        item = self.list.item(index)
+        widget = self.list.itemWidget(item)
+        self.list.removeItemWidget(item)
+        if widget is not None:
+            widget.deleteLater()
+        self.list.takeItem(index)
 
     def empty_agenda_card(self) -> QWidget:
         frame = QFrame()

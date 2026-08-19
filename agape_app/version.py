@@ -1,3 +1,3 @@
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 UPDATE_REPOSITORY = "HerickCallegari/Agape"
 UPDATE_ASSET_NAME = "ClinicaAgape-Setup.exe"
