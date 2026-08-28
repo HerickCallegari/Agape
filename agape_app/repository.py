@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
-from supabase import Client, create_client
+from supabase import Client, ClientOptions, create_client
 
 from .config import Settings
 
@@ -17,6 +17,7 @@ class AppError(Exception):
 
 
 class SupabaseRepository:
+    POSTGREST_TIMEOUT = httpx.Timeout(connect=8.0, read=20.0, write=20.0, pool=5.0)
     DEFAULT_PROFESSIONAL_SPECIALTY = "Outra"
     DOCUMENTS_BUCKET = "professional-documents"
     MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024
@@ -63,7 +64,11 @@ class SupabaseRepository:
         if not settings.is_configured:
             raise AppError("Configure SUPABASE_URL e SUPABASE_ANON_KEY no arquivo .env.")
         self.settings = settings
-        self.client: Client = create_client(settings.supabase_url, settings.supabase_anon_key)
+        self.client: Client = create_client(
+            settings.supabase_url,
+            settings.supabase_anon_key,
+            options=ClientOptions(postgrest_client_timeout=self.POSTGREST_TIMEOUT),
+        )
         self.user = None
         self.access_token: str | None = None
         self.profile: dict[str, Any] | None = None

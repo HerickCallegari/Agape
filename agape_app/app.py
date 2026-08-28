@@ -11,7 +11,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QDate, QThread, QTime, QTimer, Qt, Signal
+import httpx
+from PySide6.QtCore import QDate, QObject, QRunnable, QThread, QThreadPool, QTime, QTimer, Qt, Signal, Slot
 from PySide6.QtCore import QSize
 from PySide6.QtGui import QColor, QIcon, QPixmap, QTextCharFormat, QBrush, QIntValidator
 from PySide6.QtWidgets import (
@@ -163,6 +164,55 @@ _LAST_ERROR_SIGNATURE = ""
 _LAST_ERROR_AT: datetime | None = None
 
 
+class WorkerSignals(QObject):
+    completed = Signal(object, object, object)
+
+
+class FunctionWorker(QRunnable):
+    """Executa uma função sem bloquear o event loop e devolve tudo por signal."""
+
+    _next_task_id = 0
+
+    def __init__(self, function, *args, **kwargs):
+        super().__init__()
+        FunctionWorker._next_task_id += 1
+        self.task_id = FunctionWorker._next_task_id
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+    @Slot()
+    def run(self) -> None:
+        result = None
+        error = None
+        try:
+            result = self.function(*self.args, **self.kwargs)
+        except Exception as exc:
+            error = exc
+        self.signals.completed.emit(self.task_id, result, error)
+
+
+def start_worker(owner: QWidget, callback, function, *args, **kwargs) -> int:
+    """Mantém o QRunnable vivo até a entrega do resultado ao objeto Qt receptor."""
+
+    workers = getattr(owner, "_background_workers", None)
+    if workers is None:
+        workers = {}
+        owner._background_workers = workers
+    worker = FunctionWorker(function, *args, **kwargs)
+    workers[worker.task_id] = worker
+    worker.signals.completed.connect(callback)
+    QThreadPool.globalInstance().start(worker)
+    return worker.task_id
+
+
+def forget_worker(owner: QWidget, task_id: int) -> None:
+    workers = getattr(owner, "_background_workers", None)
+    if workers is not None:
+        workers.pop(task_id, None)
+
+
 def apply_window_icon(window: QWidget) -> None:
     icon = app_icon()
     window.setWindowIcon(icon)
@@ -195,6 +245,10 @@ def log_exception(context: str, exc: Exception) -> None:
 
 def friendly_error_message(exc: Exception) -> str:
     raw = str(exc)
+    if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException)):
+        return "O servidor demorou para responder. Verifique sua conexão e tente novamente."
+    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
+        return "Não foi possível conectar ao servidor. Verifique sua conexão e tente novamente."
     if "JSON could not be generated" in raw or "Bad Request" in raw:
         return (
             "Não foi possível atualizar alguns dados agora. "
@@ -603,6 +657,7 @@ class MainWindow(QMainWindow):
         self.auto_refresh_timer = QTimer(self)
         self.auto_refresh_timer.setInterval(10_000)
         self.auto_refresh_timer.timeout.connect(self.auto_refresh_current_page)
+        self.agenda_page.activity_completed.connect(self.restart_auto_refresh_timer)
         self.auto_refresh_timer.start()
 
     def showEvent(self, event) -> None:
@@ -651,9 +706,15 @@ class MainWindow(QMainWindow):
         label, page = self.pages[index]
         if label not in {"Início", "Agenda"} or not hasattr(page, "refresh"):
             return
-        if label == "Agenda" and page.list.verticalScrollBar().isSliderDown():
+        if label == "Agenda":
+            if page.is_busy or page.list.verticalScrollBar().isSliderDown():
+                return
+            page.refresh(show_popup=False)
             return
         self.safe_refresh_page(page, show_popup=False)
+
+    def restart_auto_refresh_timer(self) -> None:
+        self.auto_refresh_timer.start()
 
 
 class DashboardPage(QWidget):
@@ -1567,6 +1628,8 @@ class ProfessionalDialog(QDialog):
 
 
 class AgendaPage(QWidget):
+    activity_completed = Signal()
+
     def __init__(self, repo: SupabaseRepository, profile: dict[str, Any]):
         super().__init__()
         self.repo = repo
@@ -1574,6 +1637,14 @@ class AgendaPage(QWidget):
         self.admin_mode_enabled = profile.get("role") == "reception"
         self.rows: list[dict[str, Any]] = []
         self.professionals: list[dict[str, Any]] = []
+        self._refresh_in_progress = False
+        self._refresh_pending = False
+        self._refresh_pending_popup = False
+        self._refresh_task_id: int | None = None
+        self._write_in_progress = False
+        self._write_task_id: int | None = None
+        self._allowed_to_manage = can(profile, Permission.MANAGE_AGENDA)
+        self._pending_scroll_state = (0, False)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(18)
@@ -1591,7 +1662,7 @@ class AgendaPage(QWidget):
         filter_title = QLabel("Selecionar data")
         filter_title.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-size: 17px; font-weight: 800;")
         self.date_edit = QDateEdit(QDate.currentDate())
-        self.date_edit.dateChanged.connect(self.refresh)
+        self.date_edit.dateChanged.connect(lambda _value: self.refresh())
         self.date_edit.hide()
         self.calendar = QCalendarWidget()
         self.calendar.setGridVisible(False)
@@ -1613,7 +1684,7 @@ class AgendaPage(QWidget):
         self.professional_filter = QComboBox()
         self.professional_filter.setObjectName("AgendaProfessional")
         self.professional_filter.setMinimumHeight(46)
-        self.professional_filter.currentIndexChanged.connect(self.refresh)
+        self.professional_filter.currentIndexChanged.connect(lambda _index: self.refresh())
         self.new_appointment = button("Novo atendimento")
         self.new_appointment.setMinimumHeight(40)
         self.new_appointment.clicked.connect(self.create_appointment)
@@ -1623,10 +1694,9 @@ class AgendaPage(QWidget):
         self.bulk_edit = button("Alterar atendimentos", secondary=True)
         self.bulk_edit.setMinimumHeight(40)
         self.bulk_edit.clicked.connect(self.edit_appointments_bulk)
-        allowed = can(profile, Permission.MANAGE_AGENDA)
-        self.new_appointment.setEnabled(allowed)
-        self.new_recurring.setEnabled(allowed)
-        self.bulk_edit.setVisible(allowed)
+        self.new_appointment.setEnabled(self._allowed_to_manage)
+        self.new_recurring.setEnabled(self._allowed_to_manage)
+        self.bulk_edit.setVisible(self._allowed_to_manage)
         self.day_stat_labels: dict[str, QLabel] = {}
         stats_panel = QFrame()
         style_card(stats_panel, COLORS["bg2"], COLORS["line"])
@@ -1685,6 +1755,10 @@ class AgendaPage(QWidget):
             f"background: {COLORS['primary_soft']}; color: {COLORS['primary']}; "
             "border-radius: 8px; padding: 7px 12px; font-weight: 800;"
         )
+        self.loading_label = QLabel("")
+        self.loading_label.setObjectName("Muted")
+        self.loading_label.setStyleSheet(f"background: transparent; color: {COLORS['primary']}; font-weight: 700;")
+        self.loading_label.hide()
         canvas_header.addLayout(canvas_title_box)
         canvas_header.addStretch()
         canvas_header.addWidget(self.new_appointment)
@@ -1701,6 +1775,7 @@ class AgendaPage(QWidget):
         self.list.itemDoubleClicked.connect(self.open_selected)
         canvas_layout.addLayout(canvas_header)
         canvas_layout.addWidget(self.summary_badge, 0, Qt.AlignLeft)
+        canvas_layout.addWidget(self.loading_label, 0, Qt.AlignLeft)
         canvas_layout.addWidget(self.list, 1)
 
         layout.addWidget(title)
@@ -1737,7 +1812,6 @@ class AgendaPage(QWidget):
             return
         self.admin_mode_enabled = enabled
         self.professionals_loaded = False
-        self.load_professionals()
         self.refresh()
 
     def can_view_all_agendas(self) -> bool:
@@ -1749,16 +1823,24 @@ class AgendaPage(QWidget):
         profile_id = self.profile.get("id")
         return [professional for professional in self.professionals if professional.get("profile_id") == profile_id]
 
-    def load_professionals(self) -> None:
+    @property
+    def is_busy(self) -> bool:
+        return self._refresh_in_progress or self._write_in_progress
+
+    def _set_busy_ui(self, message: str = "") -> None:
+        busy = self.is_busy
+        self.loading_label.setText(message)
+        self.loading_label.setVisible(bool(message))
+        self.new_appointment.setEnabled(self._allowed_to_manage and not busy)
+        self.new_recurring.setEnabled(self._allowed_to_manage and not busy)
+        self.bulk_edit.setEnabled(self._allowed_to_manage and not busy)
+        self.list.setEnabled(not busy)
+
+    def _apply_professionals(self, professionals: list[dict[str, Any]], preferred_id: str | None) -> None:
         self.professional_filter.blockSignals(True)
         self.professional_filter.clear()
-        try:
-            self.professionals = self.repo.professionals(active_only=True)
-            self.professionals_loaded = True
-        except Exception as exc:
-            log_exception("Erro ao carregar profissionais da agenda", exc)
-            self.professionals = []
-            self.professionals_loaded = False
+        self.professionals = professionals
+        self.professionals_loaded = True
         if self.can_view_all_agendas():
             self.professional_filter.addItem("Todos os profissionais", None)
             visible_professionals = self.professionals
@@ -1768,28 +1850,100 @@ class AgendaPage(QWidget):
                 self.professional_filter.addItem("Nenhuma agenda vinculada", None)
         for professional in visible_professionals:
             self.professional_filter.addItem(professional["full_name"], professional["id"])
+        preferred_index = self.professional_filter.findData(preferred_id)
+        if preferred_index >= 0:
+            self.professional_filter.setCurrentIndex(preferred_index)
         self.professional_filter.setEnabled(self.can_view_all_agendas() or len(visible_professionals) > 1)
         self.professional_filter.blockSignals(False)
 
-    def refresh(self) -> None:
+    def _fetch_agenda(
+        self,
+        selected: date,
+        requested_professional_id: str | None,
+        reload_professionals: bool,
+        admin_mode_enabled: bool,
+    ) -> dict[str, Any]:
+        professionals = self.repo.professionals(active_only=True) if reload_professionals else list(self.professionals)
+        can_view_all = self.profile.get("role") == "reception" or (
+            self.profile.get("role") == "admin" and admin_mode_enabled
+        )
+        professional_id = requested_professional_id
+        if not can_view_all:
+            own = [row for row in professionals if row.get("profile_id") == self.profile.get("id")]
+            own_ids = {row.get("id") for row in own}
+            if professional_id not in own_ids:
+                professional_id = own[0].get("id") if own else None
+        rows = [] if not can_view_all and professional_id is None else self.repo.appointments(selected, professional_id)
+        return {
+            "selected": selected,
+            "professional_id": professional_id,
+            "professionals": professionals if reload_professionals else None,
+            "rows": rows,
+        }
+
+    def refresh(self, show_popup: bool = True) -> None:
+        if self._refresh_in_progress or self._write_in_progress:
+            self._refresh_pending = True
+            self._refresh_pending_popup = self._refresh_pending_popup or bool(show_popup)
+            LOGGER.info("Atualização da agenda marcada como pendente; outra operação está em andamento")
+            return
         scroll_bar = self.list.verticalScrollBar()
         previous_scroll_value = scroll_bar.value()
         was_at_bottom = (
             scroll_bar.maximum() > scroll_bar.minimum()
             and previous_scroll_value >= scroll_bar.maximum() - 2
         )
-        if not self.professionals_loaded:
-            self.load_professionals()
         selected = self.date_edit.date().toPython()
         professional_id = self.professional_filter.currentData()
-        try:
-            if not self.can_view_all_agendas() and professional_id is None:
-                self.rows = []
+        self._pending_scroll_state = (previous_scroll_value, was_at_bottom)
+        self._refresh_in_progress = True
+        self._refresh_pending_popup = bool(show_popup)
+        self._set_busy_ui("Atualizando agenda...")
+        LOGGER.info("Iniciando atualização da agenda")
+        self._refresh_task_id = start_worker(
+            self,
+            self._on_refresh_completed,
+            self._fetch_agenda,
+            selected,
+            professional_id,
+            not self.professionals_loaded,
+            self.admin_mode_enabled,
+        )
+
+    @Slot(object, object, object)
+    def _on_refresh_completed(self, task_id: int, result: dict[str, Any] | None, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._refresh_task_id:
+            return
+        show_popup = self._refresh_pending_popup
+        self._refresh_task_id = None
+        self._refresh_in_progress = False
+        if error is not None:
+            log_exception("Falha ao atualizar agenda", error)
+            if show_popup:
+                show_error(self, error)
+        elif result is not None:
+            if result.get("professionals") is not None:
+                self._apply_professionals(result["professionals"], result.get("professional_id"))
+            current_key = (self.date_edit.date().toPython(), self.professional_filter.currentData())
+            result_key = (result["selected"], result.get("professional_id"))
+            if current_key == result_key:
+                self.rows = result["rows"]
+                self._render_rows(result["selected"])
+                LOGGER.info("Atualização da agenda concluída")
+                self.activity_completed.emit()
             else:
-                self.rows = self.repo.appointments(selected, professional_id)
-        except Exception as exc:
-            show_error(self, exc)
-            self.rows = []
+                self._refresh_pending = True
+                LOGGER.info("Resultado antigo da agenda descartado; uma nova atualização será executada")
+        pending = self._refresh_pending
+        pending_popup = self._refresh_pending_popup
+        self._refresh_pending = False
+        self._refresh_pending_popup = False
+        self._set_busy_ui("")
+        if pending:
+            self.refresh(show_popup=pending_popup)
+
+    def _render_rows(self, selected: date) -> None:
         confirmed = sum(1 for row in self.rows if row.get("status") == "Confirmado")
         completed = sum(1 for row in self.rows if row.get("status") == "Atendido")
         pending = sum(1 for row in self.rows if row.get("status") not in {"Atendido", "Cancelado"})
@@ -1801,11 +1955,13 @@ class AgendaPage(QWidget):
         self.day_stat_labels["completed"].setText(str(completed))
         self.day_stat_labels["pending"].setText(str(pending))
         self.reconcile_appointment_list()
-        QTimer.singleShot(
-            0,
-            lambda: scroll_bar.setValue(
-                scroll_bar.maximum() if was_at_bottom else min(previous_scroll_value, scroll_bar.maximum())
-            ),
+        QTimer.singleShot(0, self._restore_scroll_position)
+
+    def _restore_scroll_position(self) -> None:
+        scroll_bar = self.list.verticalScrollBar()
+        previous_scroll_value, was_at_bottom = self._pending_scroll_state
+        scroll_bar.setValue(
+            scroll_bar.maximum() if was_at_bottom else min(previous_scroll_value, scroll_bar.maximum())
         )
 
     def reconcile_appointment_list(self) -> None:
@@ -1839,36 +1995,40 @@ class AgendaPage(QWidget):
         for index in reversed(obsolete_rows):
             self.remove_appointment_item(index)
 
-        for row in self.rows:
+        for target_index, row in enumerate(self.rows):
             appointment_id = row["id"]
             item = existing_items.get(appointment_id)
             if item is None:
-                item = self.add_appointment_item(row)
+                item = self.add_appointment_item(row, target_index)
                 existing_items[appointment_id] = item
             elif item.data(Qt.UserRole) != row:
                 self.update_appointment_item(item, row)
 
-        for target_index, appointment_id in enumerate(desired_ids):
-            item = existing_items[appointment_id]
-            current_index = self.list.row(item)
-            if current_index == target_index:
-                continue
-            widget = self.list.itemWidget(item)
-            self.list.removeItemWidget(item)
-            moved_item = self.list.takeItem(current_index)
-            self.list.insertItem(target_index, moved_item)
-            self.list.setItemWidget(moved_item, widget)
+        # Nunca retire um widget de um item para anexá-lo novamente. O QListWidget
+        # assume a propriedade do widget e o Qt pode destruí-lo durante essa troca,
+        # deixando o wrapper Python apontando para um objeto C++ inválido. Novos
+        # atendimentos já são inseridos na posição correta acima; se a ordem dos
+        # itens existentes mudou, uma reconstrução limpa é mais segura.
+        current_ids = [
+            (self.list.item(index).data(Qt.UserRole) or {}).get("id")
+            for index in range(self.list.count())
+        ]
+        if current_ids != desired_ids:
+            self.rebuild_appointment_list()
 
     def rebuild_appointment_list(self) -> None:
         self.list.clear()
         for row in self.rows:
             self.add_appointment_item(row)
 
-    def add_appointment_item(self, row: dict[str, Any]) -> QListWidgetItem:
+    def add_appointment_item(self, row: dict[str, Any], index: int | None = None) -> QListWidgetItem:
         item = QListWidgetItem()
         item.setData(Qt.UserRole, row)
         item.setSizeHint(QSize(10, 96))
-        self.list.addItem(item)
+        if index is None:
+            self.list.addItem(item)
+        else:
+            self.list.insertItem(index, item)
         self.list.setItemWidget(item, self.appointment_card(row))
         return item
 
@@ -1968,20 +2128,78 @@ class AgendaPage(QWidget):
         previous_status = appointment.get("status", "")
         if not status or status == previous_status:
             return
-        combo.setEnabled(False)
-        try:
-            self.repo.update_appointment_status(appointment["id"], status)
-            appointment["status"] = status
-            self.update_day_summary()
-            QTimer.singleShot(0, lambda: self.apply_status_style(combo, status))
-        except Exception as exc:
+        if self.is_busy:
             combo.blockSignals(True)
             combo.setCurrentText(previous_status)
             combo.blockSignals(False)
-            self.apply_status_style(combo, previous_status)
-            show_error(self, exc)
-        finally:
+            return
+        self._write_in_progress = True
+        combo.setEnabled(False)
+        self._set_busy_ui("Salvando status...")
+        self._write_context = {
+            "kind": "status",
+            "appointment": appointment,
+            "combo": combo,
+            "status": status,
+            "previous_status": previous_status,
+        }
+        LOGGER.info("Iniciando alteração de status do atendimento")
+        self._write_task_id = start_worker(
+            self, self._on_agenda_write_completed, self.repo.update_appointment_status, appointment["id"], status
+        )
+
+    @Slot(object, object, object)
+    def _on_agenda_write_completed(self, task_id: int, result: Any, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._write_task_id:
+            return
+        context = getattr(self, "_write_context", {})
+        self._write_task_id = None
+        self._write_in_progress = False
+        kind = context.get("kind")
+        request_refresh = False
+        if kind == "status":
+            appointment = context["appointment"]
+            combo = context["combo"]
+            status = context["status"]
+            previous_status = context["previous_status"]
+            if error is None:
+                appointment["status"] = status
+                self.update_day_summary()
+                self.apply_status_style(combo, status)
+                LOGGER.info("Alteração de status concluída")
+                self.activity_completed.emit()
+            else:
+                combo.blockSignals(True)
+                combo.setCurrentText(previous_status)
+                combo.blockSignals(False)
+                self.apply_status_style(combo, previous_status)
+                show_error(self, error)
             combo.setEnabled(True)
+        elif kind == "create":
+            if error is None:
+                LOGGER.info("Criação de atendimento concluída")
+                request_refresh = True
+            else:
+                show_error(self, error)
+        elif kind == "recurring":
+            if error is None:
+                QMessageBox.information(self, "Agenda fixa", f"{result} atendimentos gerados.")
+                LOGGER.info("Criação de agenda fixa concluída")
+                request_refresh = True
+            else:
+                show_error(self, error)
+        self._write_context = {}
+        self._set_busy_ui("")
+        if request_refresh:
+            self._refresh_pending = False
+            self._refresh_pending_popup = False
+            self.refresh()
+        elif self._refresh_pending and not self._refresh_in_progress:
+            pending_popup = self._refresh_pending_popup
+            self._refresh_pending = False
+            self._refresh_pending_popup = False
+            self.refresh(show_popup=pending_popup)
 
     def apply_status_style(self, combo: QComboBox, status: str) -> None:
         bg, fg = STATUS_COLORS.get(status, ("#FFFFFF", COLORS["text"]))
@@ -2023,37 +2241,117 @@ class AgendaPage(QWidget):
             self.refresh()
 
     def create_appointment(self) -> None:
-        dialog = AppointmentDialog(self, self.repo, self.date_edit.date().toPython())
-        if dialog.exec():
-            try:
-                self.repo.save_appointment(dialog.values())
-                self.refresh()
-            except Exception as exc:
-                show_error(self, exc)
+        if self.is_busy:
+            return
+        self._write_in_progress = True
+        self._set_busy_ui("Carregando formulário...")
+        self._write_context = {"kind": "prepare_create", "selected_date": self.date_edit.date().toPython()}
+        self._write_task_id = start_worker(
+            self,
+            self._on_create_form_loaded,
+            lambda: {
+                "patients": self.repo.patients(active_only=True),
+                "professionals": self.repo.professionals(active_only=True),
+            },
+        )
+
+    @Slot(object, object, object)
+    def _on_create_form_loaded(self, task_id: int, result: dict[str, Any] | None, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._write_task_id:
+            return
+        selected_date = self._write_context.get("selected_date", self.date_edit.date().toPython())
+        self._write_task_id = None
+        self._write_in_progress = False
+        self._write_context = {}
+        self._set_busy_ui("")
+        if error is not None:
+            show_error(self, error)
+            return
+        dialog = AppointmentDialog(
+            self,
+            self.repo,
+            selected_date,
+            patients=result["patients"],
+            professionals=result["professionals"],
+        )
+        if not dialog.exec():
+            return
+        values = dialog.values()
+        self._write_in_progress = True
+        self._write_context = {"kind": "create"}
+        self._set_busy_ui("Salvando atendimento...")
+        LOGGER.info("Iniciando criação de atendimento")
+        self._write_task_id = start_worker(
+            self, self._on_agenda_write_completed, self.repo.save_appointment, values
+        )
 
     def create_recurring(self) -> None:
-        dialog = RecurringDialog(self, self.repo)
-        if dialog.exec():
-            try:
-                count = self.repo.save_recurring_schedule(dialog.values())
-                QMessageBox.information(self, "Agenda fixa", f"{count} atendimentos gerados.")
-                self.refresh()
-            except Exception as exc:
-                show_error(self, exc)
+        if self.is_busy:
+            return
+        self._write_in_progress = True
+        self._set_busy_ui("Carregando formulário...")
+        self._write_task_id = start_worker(
+            self,
+            self._on_recurring_form_loaded,
+            lambda: {
+                "patients": self.repo.patients(active_only=True),
+                "professionals": self.repo.professionals(active_only=True),
+            },
+        )
+
+    @Slot(object, object, object)
+    def _on_recurring_form_loaded(self, task_id: int, result: dict[str, Any] | None, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._write_task_id:
+            return
+        self._write_task_id = None
+        self._write_in_progress = False
+        self._set_busy_ui("")
+        if error is not None:
+            show_error(self, error)
+            return
+        dialog = RecurringDialog(
+            self,
+            self.repo,
+            patients=result["patients"],
+            professionals=result["professionals"],
+        )
+        if not dialog.exec():
+            return
+        values = dialog.values()
+        self._write_in_progress = True
+        self._write_context = {"kind": "recurring"}
+        self._set_busy_ui("Gerando atendimentos...")
+        self._write_task_id = start_worker(
+            self, self._on_agenda_write_completed, self.repo.save_recurring_schedule, values
+        )
 
     def edit_appointments_bulk(self) -> None:
         dialog = BulkAppointmentEditDialog(self, self.repo)
-        if dialog.exec():
+        dialog.exec()
+
+    @Slot(object, object, object)
+    def _on_bulk_write_notification(self, _task_id: int, _result: Any, error: Exception | None) -> None:
+        if error is None:
             self.refresh()
 
 
 class AppointmentDialog(QDialog):
-    def __init__(self, parent: QWidget, repo: SupabaseRepository, selected_date: date):
+    def __init__(
+        self,
+        parent: QWidget,
+        repo: SupabaseRepository,
+        selected_date: date,
+        *,
+        patients: list[dict[str, Any]] | None = None,
+        professionals: list[dict[str, Any]] | None = None,
+    ):
         super().__init__(parent)
         self.repo = repo
         self.setWindowTitle("Atendimento")
-        self.patients = repo.patients(active_only=True)
-        self.professionals = repo.professionals(active_only=True)
+        self.patients = patients if patients is not None else repo.patients(active_only=True)
+        self.professionals = professionals if professionals is not None else repo.professionals(active_only=True)
         layout = QFormLayout(self)
         self.patient = QComboBox()
         for item in self.patients:
@@ -2093,12 +2391,19 @@ class AppointmentDialog(QDialog):
 
 
 class RecurringDialog(QDialog):
-    def __init__(self, parent: QWidget, repo: SupabaseRepository):
+    def __init__(
+        self,
+        parent: QWidget,
+        repo: SupabaseRepository,
+        *,
+        patients: list[dict[str, Any]] | None = None,
+        professionals: list[dict[str, Any]] | None = None,
+    ):
         super().__init__(parent)
         self.repo = repo
         self.setWindowTitle("Agenda fixa")
-        self.patients = repo.patients(active_only=True)
-        self.professionals = repo.professionals(active_only=True)
+        self.patients = patients if patients is not None else repo.patients(active_only=True)
+        self.professionals = professionals if professionals is not None else repo.professionals(active_only=True)
         layout = QFormLayout(self)
         self.patient = QComboBox()
         for item in self.patients:
@@ -2151,6 +2456,14 @@ class BulkAppointmentEditDialog(QDialog):
         self.rows: list[dict[str, Any]] = []
         self.appointment_checks: list[QCheckBox] = []
         self.updating_checks = False
+        self.professionals: list[dict[str, Any]] = []
+        self.patients: list[dict[str, Any]] = []
+        self._load_in_progress = False
+        self._load_pending = False
+        self._load_task_id: int | None = None
+        self._active_load_key: tuple[Any, ...] | None = None
+        self._write_in_progress = False
+        self._write_task_id: int | None = None
         self.setWindowTitle("Alterar atendimentos em lote")
         self.setMinimumSize(980, 680)
         layout = QVBoxLayout(self)
@@ -2161,8 +2474,13 @@ class BulkAppointmentEditDialog(QDialog):
         title.setObjectName("PageTitle")
         hint = QLabel("Filtre, selecione uma ou mais linhas e escolha as alterações que deseja aplicar.")
         hint.setObjectName("Muted")
+        self.loading_label = QLabel("")
+        self.loading_label.setObjectName("Muted")
+        self.loading_label.setStyleSheet(f"color: {COLORS['primary']}; font-weight: 700;")
+        self.loading_label.hide()
         layout.addWidget(title)
         layout.addWidget(hint)
+        layout.addWidget(self.loading_label)
 
         filters = QGridLayout()
         today = QDate.currentDate()
@@ -2178,23 +2496,17 @@ class BulkAppointmentEditDialog(QDialog):
             self.weekday_filter.addItem(label, weekday)
         self.professional = QComboBox()
         self.professional.addItem("Todos os profissionais", None)
-        professionals = repo.professionals(active_only=False)
-        for item in professionals:
-            self.professional.addItem(item["full_name"], item["id"])
         self.patient = QComboBox()
         self.patient.addItem("Todos os pacientes", None)
-        patients = repo.patients(active_only=False)
-        for item in patients:
-            self.patient.addItem(item["full_name"], item["id"])
-        search = button("Buscar", secondary=True)
-        search.clicked.connect(self.load_rows)
+        self.search_button = button("Buscar", secondary=True)
+        self.search_button.clicked.connect(self.load_rows)
         for column, (label, widget) in enumerate(
             [("Data inicial", self.start_date), ("Data final", self.end_date), ("Dia da semana", self.weekday_filter),
              ("Profissional", self.professional), ("Paciente", self.patient)]
         ):
             filters.addWidget(QLabel(label), 0, column)
             filters.addWidget(widget, 1, column)
-        filters.addWidget(search, 1, 5)
+        filters.addWidget(self.search_button, 1, 5)
         layout.addLayout(filters)
 
         self.table = QTableWidget(0, 7)
@@ -2228,14 +2540,14 @@ class BulkAppointmentEditDialog(QDialog):
         selection_bar = QHBoxLayout()
         self.result_label = QLabel("0 atendimento(s)")
         self.result_label.setObjectName("Muted")
-        select_all = button("Selecionar todos", secondary=True)
-        select_all.clicked.connect(self.select_all)
-        clear_selection = button("Limpar seleção", secondary=True)
-        clear_selection.clicked.connect(self.clear_selection)
+        self.select_all_button = button("Selecionar todos", secondary=True)
+        self.select_all_button.clicked.connect(self.select_all)
+        self.clear_selection_button = button("Limpar seleção", secondary=True)
+        self.clear_selection_button.clicked.connect(self.clear_selection)
         selection_bar.addWidget(self.result_label)
         selection_bar.addStretch()
-        selection_bar.addWidget(select_all)
-        selection_bar.addWidget(clear_selection)
+        selection_bar.addWidget(self.select_all_button)
+        selection_bar.addWidget(self.clear_selection_button)
         layout.addLayout(selection_bar)
 
         changes = page_card()
@@ -2257,12 +2569,8 @@ class BulkAppointmentEditDialog(QDialog):
         self.fee.setPlaceholderText("Ex.: 150,00")
         self.target_professional = QComboBox()
         self.target_professional.addItem("Não alterar", None)
-        for item in professionals:
-            self.target_professional.addItem(item["full_name"], item["id"])
         self.target_patient = QComboBox()
         self.target_patient.addItem("Não alterar", None)
-        for item in patients:
-            self.target_patient.addItem(item["full_name"], item["id"])
         time_box = QVBoxLayout()
         time_fields = QHBoxLayout()
         start_box = QVBoxLayout()
@@ -2304,20 +2612,22 @@ class BulkAppointmentEditDialog(QDialog):
         layout.addWidget(changes)
 
         actions = QHBoxLayout()
-        delete_button = button("Excluir selecionados", danger=True)
-        delete_button.clicked.connect(self.delete_selected)
+        self.delete_button = button("Excluir selecionados", danger=True)
+        self.delete_button.clicked.connect(self.delete_selected)
         cancel = button("Cancelar", secondary=True)
         cancel.clicked.connect(self.reject)
-        apply_button = button("Aplicar alterações")
-        apply_button.clicked.connect(self.apply_changes)
+        self.apply_button = button("Aplicar alterações")
+        self.apply_button.clicked.connect(self.apply_changes)
         actions.addStretch()
-        actions.addWidget(delete_button)
+        actions.addWidget(self.delete_button)
         actions.addWidget(cancel)
-        actions.addWidget(apply_button)
+        actions.addWidget(self.apply_button)
         layout.addLayout(actions)
-        self.load_rows()
+        QTimer.singleShot(0, self.load_initial_data)
 
     def delete_selected(self) -> None:
+        if self._write_in_progress or self._load_in_progress:
+            return
         selected = self.selected_appointments()
         if not selected:
             QMessageBox.warning(self, "Nenhuma seleção", "Selecione pelo menos um atendimento na tabela.")
@@ -2331,16 +2641,16 @@ class BulkAppointmentEditDialog(QDialog):
         )
         if answer != QMessageBox.Yes:
             return
-        try:
-            count = self.repo.delete_appointments_bulk(
-                [appointment["id"] for appointment in selected if appointment.get("id")]
-            )
-            QMessageBox.information(
-                self, "Atendimentos excluídos", f"{count} atendimento(s) excluído(s) com sucesso."
-            )
-            self.load_rows()
-        except Exception as exc:
-            show_error(self, exc)
+        appointment_ids = [appointment["id"] for appointment in selected if appointment.get("id")]
+        self._write_in_progress = True
+        self._write_kind = "delete"
+        self._deleted_ids = set(appointment_ids)
+        self._set_busy_ui("Excluindo atendimentos...")
+        LOGGER.info("Iniciando exclusão em lote de %s atendimento(s)", len(appointment_ids))
+        self._write_task_id = start_worker(
+            self, self._on_bulk_write_completed, self.repo.delete_appointments_bulk, appointment_ids
+        )
+        self._notify_parent_when_completed(self._write_task_id)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -2363,24 +2673,144 @@ class BulkAppointmentEditDialog(QDialog):
             available.height() - top_margin - bottom_margin,
         )
 
+    @property
+    def is_busy(self) -> bool:
+        return self._load_in_progress or self._write_in_progress
+
+    def _set_busy_ui(self, message: str = "") -> None:
+        busy = self.is_busy
+        self.loading_label.setText(message)
+        self.loading_label.setVisible(bool(message))
+        self.search_button.setEnabled(not busy)
+        self.delete_button.setEnabled(not busy)
+        self.apply_button.setEnabled(not busy)
+        self.table.setEnabled(not busy)
+        self.select_all_button.setEnabled(not busy)
+        self.clear_selection_button.setEnabled(not busy)
+        for control in (
+            self.start_date,
+            self.end_date,
+            self.weekday_filter,
+            self.professional,
+            self.patient,
+        ):
+            control.setEnabled(not busy)
+
+    def _notify_parent_when_completed(self, task_id: int) -> None:
+        parent = self.parentWidget()
+        worker = getattr(self, "_background_workers", {}).get(task_id)
+        if worker is not None and isinstance(parent, AgendaPage):
+            worker.signals.completed.connect(parent._on_bulk_write_notification)
+
+    def _fetch_bulk_initial_data(self, start: date, end: date) -> dict[str, Any]:
+        return {
+            "professionals": self.repo.professionals(active_only=False),
+            "patients": self.repo.patients(active_only=False),
+            "rows": self.repo.financial_appointments(start, end),
+        }
+
+    def load_initial_data(self) -> None:
+        if self._load_in_progress:
+            return
+        self._load_in_progress = True
+        self._active_load_key = (
+            self.start_date.date().toPython(), self.end_date.date().toPython(), None, None, None
+        )
+        self._set_busy_ui("Carregando atendimentos...")
+        self._load_task_id = start_worker(
+            self,
+            self._on_initial_data_loaded,
+            self._fetch_bulk_initial_data,
+            self.start_date.date().toPython(),
+            self.end_date.date().toPython(),
+        )
+
+    @Slot(object, object, object)
+    def _on_initial_data_loaded(self, task_id: int, result: dict[str, Any] | None, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._load_task_id:
+            return
+        self._load_task_id = None
+        self._active_load_key = None
+        self._load_in_progress = False
+        self._set_busy_ui("")
+        if error is not None:
+            show_error(self, error)
+            return
+        self.professionals = result["professionals"]
+        self.patients = result["patients"]
+        for combo in (self.professional, self.target_professional):
+            for item in self.professionals:
+                combo.addItem(item["full_name"], item["id"])
+        for combo in (self.patient, self.target_patient):
+            for item in self.patients:
+                combo.addItem(item["full_name"], item["id"])
+        self._render_bulk_rows(result["rows"])
+
+    def _fetch_bulk_rows(
+        self,
+        start: date,
+        end: date,
+        patient_id: str | None,
+        professional_id: str | None,
+        weekday: int | None,
+    ) -> list[dict[str, Any]]:
+        rows = self.repo.financial_appointments(
+            start, end, patient_id=patient_id, professional_id=professional_id
+        )
+        if weekday is not None:
+            rows = [row for row in rows if date.fromisoformat(row["appointment_date"]).weekday() == weekday]
+        return rows
+
     def load_rows(self) -> None:
         if self.end_date.date() < self.start_date.date():
             QMessageBox.warning(self, "Período inválido", "A data final deve ser maior ou igual à data inicial.")
             return
-        try:
-            self.rows = self.repo.financial_appointments(
-                self.start_date.date().toPython(), self.end_date.date().toPython(),
-                patient_id=self.patient.currentData(), professional_id=self.professional.currentData(),
-            )
-            weekday = self.weekday_filter.currentData()
-            if weekday is not None:
-                self.rows = [
-                    row for row in self.rows
-                    if date.fromisoformat(row["appointment_date"]).weekday() == weekday
-                ]
-        except Exception as exc:
-            show_error(self, exc)
+        request_key = (
+            self.start_date.date().toPython(),
+            self.end_date.date().toPython(),
+            self.patient.currentData(),
+            self.professional.currentData(),
+            self.weekday_filter.currentData(),
+        )
+        if self._load_in_progress or self._write_in_progress:
+            if self._load_in_progress and request_key == self._active_load_key:
+                return
+            self._load_pending = True
             return
+        self._load_in_progress = True
+        self._active_load_key = request_key
+        self._set_busy_ui("Atualizando resultados...")
+        self._load_task_id = start_worker(
+            self,
+            self._on_bulk_rows_loaded,
+            self._fetch_bulk_rows,
+            self.start_date.date().toPython(),
+            self.end_date.date().toPython(),
+            self.patient.currentData(),
+            self.professional.currentData(),
+            self.weekday_filter.currentData(),
+        )
+
+    @Slot(object, object, object)
+    def _on_bulk_rows_loaded(self, task_id: int, result: list[dict[str, Any]] | None, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._load_task_id:
+            return
+        self._load_task_id = None
+        self._active_load_key = None
+        self._load_in_progress = False
+        self._set_busy_ui("")
+        if error is not None:
+            show_error(self, error)
+        elif result is not None:
+            self._render_bulk_rows(result)
+        if self._load_pending:
+            self._load_pending = False
+            self.load_rows()
+
+    def _render_bulk_rows(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
         self.updating_checks = True
         self.appointment_checks = []
         self.table.clearContents()
@@ -2458,6 +2888,8 @@ class BulkAppointmentEditDialog(QDialog):
         ]
 
     def apply_changes(self) -> None:
+        if self._write_in_progress or self._load_in_progress:
+            return
         selected = self.selected_appointments()
         if not selected:
             QMessageBox.warning(self, "Nenhuma seleção", "Selecione pelo menos um atendimento na tabela.")
@@ -2485,20 +2917,47 @@ class BulkAppointmentEditDialog(QDialog):
         )
         if answer != QMessageBox.Yes:
             return
-        try:
-            count = self.repo.update_appointments_bulk(
-                selected,
-                start_time=f"{start_time}:00" if start_time else None,
-                end_time=f"{end_time}:00" if end_time else None,
-                status=self.status.currentData(),
-                consultation_fee=self.fee.text().strip() or None,
-                professional_id=self.target_professional.currentData(),
-                patient_id=self.target_patient.currentData(),
+        self._write_in_progress = True
+        self._write_kind = "update"
+        self._set_busy_ui("Aplicando alterações...")
+        LOGGER.info("Iniciando alteração em lote de %s atendimento(s)", len(selected))
+        self._write_task_id = start_worker(
+            self,
+            self._on_bulk_write_completed,
+            self.repo.update_appointments_bulk,
+            selected,
+            start_time=f"{start_time}:00" if start_time else None,
+            end_time=f"{end_time}:00" if end_time else None,
+            status=self.status.currentData(),
+            consultation_fee=self.fee.text().strip() or None,
+            professional_id=self.target_professional.currentData(),
+            patient_id=self.target_patient.currentData(),
+        )
+        self._notify_parent_when_completed(self._write_task_id)
+
+    @Slot(object, object, object)
+    def _on_bulk_write_completed(self, task_id: int, result: Any, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._write_task_id:
+            return
+        kind = getattr(self, "_write_kind", "")
+        self._write_task_id = None
+        self._write_in_progress = False
+        self._set_busy_ui("")
+        if error is not None:
+            log_exception("Falha em operação de agenda em lote", error)
+            show_error(self, error)
+            return
+        if kind == "delete":
+            self._render_bulk_rows([row for row in self.rows if row.get("id") not in self._deleted_ids])
+            QMessageBox.information(
+                self, "Atendimentos excluídos", f"{result} atendimento(s) excluído(s) com sucesso."
             )
-            QMessageBox.information(self, "Atendimentos alterados", f"{count} atendimento(s) atualizado(s).")
+            LOGGER.info("Exclusão em lote concluída")
+        elif kind == "update":
+            QMessageBox.information(self, "Atendimentos alterados", f"{result} atendimento(s) atualizado(s).")
+            LOGGER.info("Alteração em lote concluída")
             self.accept()
-        except Exception as exc:
-            show_error(self, exc)
 
 
 class AppointmentEditDialog(QDialog):
@@ -2507,6 +2966,8 @@ class AppointmentEditDialog(QDialog):
         self.repo = repo
         self.profile = profile
         self.appointment = appointment
+        self._operation_in_progress = False
+        self._operation_task_id: int | None = None
         self.setWindowTitle("Editar atendimento")
         self.setMinimumWidth(620)
         layout = QVBoxLayout(self)
@@ -2521,9 +2982,6 @@ class AppointmentEditDialog(QDialog):
         self.end_time = time_field(*end_parts)
         self.consultation_fee = QLineEdit()
         self.consultation_fee.setPlaceholderText("Ex.: 150,00")
-        financial = repo.appointment_financials(appointment["id"]) or {}
-        if financial.get("consultation_fee") is not None:
-            self.consultation_fee.setText(f"{float(financial['consultation_fee']):.2f}".replace(".", ","))
         self.status = QComboBox()
         self.status.addItems(STATUSES)
         self.status.setCurrentText(appointment["status"])
@@ -2538,41 +2996,87 @@ class AppointmentEditDialog(QDialog):
         form.addWidget(self.status, 3, 0, 1, 4)
         layout.addLayout(form)
         actions = QHBoxLayout()
-        delete_btn = button("Excluir atendimento", danger=True)
-        delete_btn.clicked.connect(self.delete_appointment)
+        self.loading_label = QLabel("Carregando dados financeiros...")
+        self.loading_label.setObjectName("Muted")
+        layout.addWidget(self.loading_label)
+        self.delete_btn = button("Excluir atendimento", danger=True)
+        self.delete_btn.clicked.connect(self.delete_appointment)
         cancel = button("Cancelar", secondary=True)
         cancel.clicked.connect(self.reject)
-        save = button("Salvar alterações")
-        save.clicked.connect(self.save_changes)
-        actions.addWidget(delete_btn)
+        self.save_btn = button("Salvar alterações")
+        self.save_btn.clicked.connect(self.save_changes)
+        actions.addWidget(self.delete_btn)
         actions.addStretch()
         actions.addWidget(cancel)
-        actions.addWidget(save)
+        actions.addWidget(self.save_btn)
         layout.addLayout(actions)
+        self._operation_in_progress = True
+        self._set_operation_ui("Carregando dados financeiros...")
+        self._operation_task_id = start_worker(
+            self, self._on_financial_loaded, self.repo.appointment_financials, appointment["id"]
+        )
+
+    def _set_operation_ui(self, message: str = "") -> None:
+        self.loading_label.setText(message)
+        self.loading_label.setVisible(bool(message))
+        self.delete_btn.setEnabled(not self._operation_in_progress)
+        self.save_btn.setEnabled(not self._operation_in_progress)
+
+    @Slot(object, object, object)
+    def _on_financial_loaded(self, task_id: int, result: dict[str, Any] | None, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._operation_task_id:
+            return
+        self._operation_task_id = None
+        self._operation_in_progress = False
+        self._set_operation_ui("")
+        if error is not None:
+            show_error(self, error)
+            return
+        financial = result or {}
+        if financial.get("consultation_fee") is not None:
+            self.consultation_fee.setText(f"{float(financial['consultation_fee']):.2f}".replace(".", ","))
 
     def save_changes(self) -> None:
+        if self._operation_in_progress:
+            return
         try:
             self.repo.parse_consultation_fee(self.consultation_fee.text())
-            self.repo.save_appointment({
+            values = {
                 "patient_id": self.appointment["patient_id"],
                 "professional_id": self.appointment["professional_id"],
                 "appointment_date": self.appointment_date.date().toPython().isoformat(),
                 "start_time": self.start_time.time().toString("HH:mm:ss"),
                 "end_time": self.end_time.time().toString("HH:mm:ss"),
                 "status": self.status.currentText(),
-            }, self.appointment["id"])
-            existing = self.repo.appointment_financials(self.appointment["id"]) or {}
-            self.repo.save_appointment_financials(self.appointment["id"], {
-                "consultation_fee": self.consultation_fee.text(),
-                "payment_status": existing.get("payment_status", "Pendente"),
-                "payment_method": existing.get("payment_method", ""),
-                "financial_notes": existing.get("financial_notes", ""),
-            })
-            self.accept()
+            }
         except Exception as exc:
             show_error(self, exc)
+            return
+        self._operation_in_progress = True
+        self._operation_kind = "save"
+        self._set_operation_ui("Salvando alterações...")
+        self._operation_task_id = start_worker(
+            self,
+            self._on_edit_operation_completed,
+            self._save_changes_in_repository,
+            values,
+            self.consultation_fee.text(),
+        )
+
+    def _save_changes_in_repository(self, values: dict[str, Any], fee: str) -> None:
+        self.repo.save_appointment(values, self.appointment["id"])
+        existing = self.repo.appointment_financials(self.appointment["id"]) or {}
+        self.repo.save_appointment_financials(self.appointment["id"], {
+            "consultation_fee": fee,
+            "payment_status": existing.get("payment_status", "Pendente"),
+            "payment_method": existing.get("payment_method", ""),
+            "financial_notes": existing.get("financial_notes", ""),
+        })
 
     def delete_appointment(self) -> None:
+        if self._operation_in_progress:
+            return
         patient = (self.appointment.get("patients") or {}).get("full_name", "este paciente")
         answer = QMessageBox.question(
             self, "Excluir atendimento",
@@ -2580,11 +3084,28 @@ class AppointmentEditDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if answer == QMessageBox.Yes:
-            try:
-                self.repo.delete_appointment(self.appointment["id"])
-                self.accept()
-            except Exception as exc:
-                show_error(self, exc)
+            self._operation_in_progress = True
+            self._operation_kind = "delete"
+            self._set_operation_ui("Excluindo atendimento...")
+            self._operation_task_id = start_worker(
+                self,
+                self._on_edit_operation_completed,
+                self.repo.delete_appointment,
+                self.appointment["id"],
+            )
+
+    @Slot(object, object, object)
+    def _on_edit_operation_completed(self, task_id: int, _result: Any, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._operation_task_id:
+            return
+        self._operation_task_id = None
+        self._operation_in_progress = False
+        self._set_operation_ui("")
+        if error is not None:
+            show_error(self, error)
+            return
+        self.accept()
 
 
 class AppointmentDetailsDialog(QDialog):
@@ -2593,6 +3114,8 @@ class AppointmentDetailsDialog(QDialog):
         self.repo = repo
         self.profile = profile
         self.appointment = appointment
+        self._note_in_progress = False
+        self._note_task_id: int | None = None
         self.setWindowTitle("Detalhes do atendimento")
         self.setMinimumSize(760, 640)
         layout = QVBoxLayout(self)
@@ -2645,27 +3168,26 @@ class AppointmentDetailsDialog(QDialog):
         self.note = QTextEdit()
         self.note.setPlaceholderText("Relatório da sessão")
         self.note.setMinimumHeight(460)
-        try:
-            existing = repo.session_note_for(appointment["id"])
-            self.note.setPlainText(existing.get("note", "") if existing else "")
-        except Exception:
-            pass
         self.note.setEnabled(can(profile, Permission.WRITE_SESSION_NOTE))
+        self.loading_label = QLabel("Carregando relatório...")
+        self.loading_label.setObjectName("Muted")
 
         edit_buttons = QHBoxLayout()
+        self.edit_button = None
         if profile.get("role") in {"admin", "reception"} and can_manage:
-            edit_button = button("Editar atendimento", secondary=True)
-            edit_button.setMinimumWidth(170)
-            edit_button.clicked.connect(self.open_edit_dialog)
-            edit_buttons.addWidget(edit_button)
+            self.edit_button = button("Editar atendimento", secondary=True)
+            self.edit_button.setMinimumWidth(170)
+            self.edit_button.clicked.connect(self.open_edit_dialog)
+            edit_buttons.addWidget(self.edit_button)
         edit_buttons.addStretch()
 
         note_buttons = QHBoxLayout()
+        self.save_note_button = None
         if can(profile, Permission.WRITE_SESSION_NOTE):
-            save_note_button = button("Salvar status e relatório" if is_professional else "Salvar relatório")
-            save_note_button.setMinimumWidth(170)
-            save_note_button.clicked.connect(self.save_session_report)
-            note_buttons.addWidget(save_note_button)
+            self.save_note_button = button("Salvar status e relatório" if is_professional else "Salvar relatório")
+            self.save_note_button.setMinimumWidth(170)
+            self.save_note_button.clicked.connect(self.save_session_report)
+            note_buttons.addWidget(self.save_note_button)
         note_buttons.addStretch()
 
         layout.addWidget(header)
@@ -2677,8 +3199,36 @@ class AppointmentDetailsDialog(QDialog):
             professional_status_row.addWidget(self.status, 1)
             layout.addLayout(professional_status_row)
         layout.addWidget(QLabel("Relatório da sessão"))
+        layout.addWidget(self.loading_label)
         layout.addWidget(self.note, 1)
         layout.addLayout(note_buttons)
+        self._note_in_progress = True
+        self._set_note_ui("Carregando relatório...")
+        self._note_task_id = start_worker(
+            self, self._on_note_loaded, self.repo.session_note_for, appointment["id"]
+        )
+
+    def _set_note_ui(self, message: str = "") -> None:
+        self.loading_label.setText(message)
+        self.loading_label.setVisible(bool(message))
+        if self.edit_button is not None:
+            self.edit_button.setEnabled(not self._note_in_progress)
+        if self.save_note_button is not None:
+            self.save_note_button.setEnabled(not self._note_in_progress)
+        self.note.setEnabled(can(self.profile, Permission.WRITE_SESSION_NOTE) and not self._note_in_progress)
+
+    @Slot(object, object, object)
+    def _on_note_loaded(self, task_id: int, result: dict[str, Any] | None, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._note_task_id:
+            return
+        self._note_task_id = None
+        self._note_in_progress = False
+        self._set_note_ui("")
+        if error is not None:
+            log_exception("Falha ao carregar relatório da sessão", error)
+            return
+        self.note.setPlainText(result.get("note", "") if result else "")
 
     def info_label(self, title: str, value: str) -> QLabel:
         label = QLabel(f"{title}\n{value}")
@@ -2694,15 +3244,39 @@ class AppointmentDetailsDialog(QDialog):
             self.accept()
 
     def save_session_report(self) -> None:
+        if self._note_in_progress:
+            return
         try:
             if not can(self.profile, Permission.WRITE_SESSION_NOTE):
                 raise AppError("Você não possui permissão para salvar o relatório da sessão.")
-            if self.profile.get("role") == "professional" and can(self.profile, Permission.CHANGE_STATUS):
-                self.repo.update_appointment_status(self.appointment["id"], self.status.currentText())
-            self.repo.save_session_note(self.appointment, self.note.toPlainText().strip())
-            self.accept()
         except Exception as exc:
             show_error(self, exc)
+            return
+        status = self.status.currentText()
+        note = self.note.toPlainText().strip()
+        self._note_in_progress = True
+        self._set_note_ui("Salvando relatório...")
+        self._note_task_id = start_worker(
+            self, self._on_note_saved, self._save_session_report_in_repository, status, note
+        )
+
+    def _save_session_report_in_repository(self, status: str, note: str) -> None:
+        if self.profile.get("role") == "professional" and can(self.profile, Permission.CHANGE_STATUS):
+            self.repo.update_appointment_status(self.appointment["id"], status)
+        self.repo.save_session_note(self.appointment, note)
+
+    @Slot(object, object, object)
+    def _on_note_saved(self, task_id: int, _result: Any, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._note_task_id:
+            return
+        self._note_task_id = None
+        self._note_in_progress = False
+        self._set_note_ui("")
+        if error is not None:
+            show_error(self, error)
+            return
+        self.accept()
 
 class FinancePage(QWidget):
     def __init__(self, repo: SupabaseRepository):
