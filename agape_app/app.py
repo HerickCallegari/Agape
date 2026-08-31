@@ -602,7 +602,7 @@ class MainWindow(QMainWindow):
             ("Início", self.dashboard_page),
             ("Agenda", self.agenda_page),
             ("Pacientes", PatientsPage(repo, profile)),
-            ("Exportar sessões", SessionExportPage(repo)),
+            ("Exportar sessões", SessionExportPage(repo, profile)),
             ("Documentos", DocumentsPage(repo, profile)),
         ]
         if can(profile, Permission.VIEW_FINANCIALS):
@@ -1248,10 +1248,12 @@ class PatientDialog(QDialog):
 
 
 class SessionExportPage(QWidget):
-    def __init__(self, repo: SupabaseRepository):
+    def __init__(self, repo: SupabaseRepository, profile: dict[str, Any]):
         super().__init__()
         self.repo = repo
+        self.profile = profile
         self.patients: list[dict[str, Any]] = []
+        self.professionals: list[dict[str, Any]] = []
         self.rows: list[dict[str, Any]] = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 28, 28, 28)
@@ -1268,6 +1270,8 @@ class SessionExportPage(QWidget):
         filters.setSpacing(14)
         self.patient = QComboBox()
         self.patient.setMinimumWidth(320)
+        self.professional = QComboBox()
+        self.professional.setMinimumWidth(240)
         self.start_date = QDateEdit(QDate.currentDate().addMonths(-1))
         self.start_date.setCalendarPopup(True)
         self.start_date.setDisplayFormat("dd/MM/yyyy")
@@ -1279,6 +1283,7 @@ class SessionExportPage(QWidget):
         load_btn = button("Carregar sessões")
         load_btn.clicked.connect(self.load_sessions)
         filters.addLayout(self.filter_field("Paciente", self.patient))
+        filters.addLayout(self.filter_field("Profissional", self.professional))
         filters.addLayout(self.filter_field("Início", self.start_date))
         filters.addLayout(self.filter_field("Fim", self.end_date))
         filters.addStretch()
@@ -1332,6 +1337,7 @@ class SessionExportPage(QWidget):
         layout.addWidget(filters_panel)
         layout.addLayout(content, 1)
         self.load_patients()
+        self.load_professionals()
 
     def filter_field(self, label: str, widget: QWidget) -> QVBoxLayout:
         box = QVBoxLayout()
@@ -1353,14 +1359,38 @@ class SessionExportPage(QWidget):
             show_error(self, exc)
             self.patients = []
 
+    def load_professionals(self) -> None:
+        self.professional.clear()
+        try:
+            self.professionals = self.repo.session_export_professionals()
+            is_admin = self.profile.get("role") == "admin"
+            if is_admin:
+                self.professional.addItem("Selecione um profissional", None)
+            for professional in self.professionals:
+                self.professional.addItem(professional.get("full_name", ""), professional.get("id"))
+            self.professional.setEnabled(is_admin)
+            if not self.professionals:
+                self.professional.addItem("Nenhum profissional vinculado", None)
+        except Exception as exc:
+            show_error(self, exc)
+            self.professionals = []
+            self.professional.addItem("Não foi possível carregar", None)
+            self.professional.setEnabled(False)
+
     def refresh(self) -> None:
         if not self.patients:
             self.load_patients()
+        if not self.professionals:
+            self.load_professionals()
 
     def load_sessions(self) -> None:
         patient_id = self.patient.currentData()
         if not patient_id:
             show_error(self, AppError("Selecione um paciente antes de carregar as sessões."))
+            return
+        professional_id = self.professional.currentData()
+        if not professional_id:
+            show_error(self, AppError("Selecione um profissional antes de carregar as sessões."))
             return
         start = self.start_date.date().toPython()
         end = self.end_date.date().toPython()
@@ -1368,7 +1398,7 @@ class SessionExportPage(QWidget):
             show_error(self, AppError("A data final deve ser maior ou igual a inicial."))
             return
         try:
-            self.rows = self.repo.patient_session_exports(patient_id, start, end)
+            self.rows = self.repo.patient_session_exports(patient_id, start, end, professional_id)
         except Exception as exc:
             show_error(self, exc)
             self.rows = []
@@ -1416,6 +1446,7 @@ class SessionExportPage(QWidget):
         rows = self.selected_rows()
         lines = [
             f"Paciente: {patient_name}",
+            f"Profissional: {self.professional.currentText()}",
             f"Período: {self.start_date.date().toString('dd/MM/yyyy')} a {self.end_date.date().toString('dd/MM/yyyy')}",
             "",
             "Sessões selecionadas",

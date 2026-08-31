@@ -145,20 +145,49 @@ class SupabaseRepository:
             or []
         )
 
-    def patient_session_exports(self, patient_id: str, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    def session_export_professionals(self) -> list[dict[str, Any]]:
+        """Returns only the professionals available to the signed-in user for exports."""
+        if not self.profile:
+            return []
+        query = (
+            self.client.table("professionals")
+            .select("id, full_name, profile_id")
+            .eq("is_active", True)
+            .order("full_name")
+        )
+        if self.profile.get("role") != "admin":
+            query = query.eq("profile_id", self.profile.get("id"))
+        return query.execute().data or []
+
+    def patient_session_exports(
+        self,
+        patient_id: str,
+        start_date: date,
+        end_date: date,
+        professional_id: str | None,
+    ) -> list[dict[str, Any]]:
+        if not professional_id:
+            raise AppError("Selecione um profissional antes de carregar as sessões.")
+        if not self.profile:
+            raise AppError("Entre no sistema antes de exportar sessões.")
+
+        if self.profile.get("role") != "admin":
+            own_professionals = self.session_export_professionals()
+            own_ids = {professional.get("id") for professional in own_professionals}
+            if professional_id not in own_ids:
+                raise AppError("Você só pode exportar as suas próprias sessões.")
+
         query = (
             self.client.table("appointments")
             .select("id, appointment_date, start_time, end_time, status, professionals(full_name, profile_id), session_notes(note)")
             .eq("patient_id", patient_id)
+            .eq("professional_id", professional_id)
             .gte("appointment_date", start_date.isoformat())
             .lte("appointment_date", end_date.isoformat())
             .order("appointment_date")
             .order("start_time")
         )
-        rows = query.execute().data or []
-        if self.profile and self.profile.get("role") == "professional":
-            rows = [row for row in rows if (row.get("professionals") or {}).get("profile_id") == self.profile["id"]]
-        return rows
+        return query.execute().data or []
 
     def profile_appointments(self, profile_id: str) -> list[dict[str, Any]]:
         professionals = self.client.table("professionals").select("id").eq("profile_id", profile_id).execute().data or []
