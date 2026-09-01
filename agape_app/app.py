@@ -1094,8 +1094,13 @@ class PatientDialog(QDialog):
         self.phone = QLineEdit(record.get("guardian_phone", "") if record else "")
         self.patient_phone = QLineEdit(record.get("patient_phone", "") if record else "")
         self.email = QLineEdit(record.get("email", "") if record else "")
-        self.birth_date = QLineEdit(record.get("birth_date", "") if record else "")
-        self.birth_date.setPlaceholderText("AAAA-MM-DD")
+        birth_date = record.get("birth_date", "") if record else ""
+        try:
+            birth_date = date.fromisoformat(str(birth_date)).strftime("%d/%m/%Y") if birth_date else ""
+        except ValueError:
+            pass
+        self.birth_date = QLineEdit(birth_date)
+        self.birth_date.setPlaceholderText("DD/MM/AAAA")
         self.document = QLineEdit(record.get("document", "") if record else "")
         self.reason = QTextEdit(record.get("reason_for_care", "") if record else "")
         self.reason.setPlaceholderText("Ex.: avaliação inicial, acompanhamento terapêutico, dificuldade de fala...")

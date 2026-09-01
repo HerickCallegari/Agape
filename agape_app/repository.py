@@ -118,10 +118,28 @@ class SupabaseRepository:
     def save_patient(self, values: dict[str, Any], record_id: str | None = None) -> None:
         if not values.get("full_name", "").strip():
             raise AppError("Preencha o nome do paciente antes de salvar.")
+        payload = dict(values)
+        payload["birth_date"] = self.normalize_patient_birth_date(payload.get("birth_date"))
         if record_id:
-            self.client.table("patients").update(values).eq("id", record_id).execute()
+            self.client.table("patients").update(payload).eq("id", record_id).execute()
         else:
-            self.client.table("patients").insert(values).execute()
+            self.client.table("patients").insert(payload).execute()
+
+    @staticmethod
+    def normalize_patient_birth_date(value: Any) -> str | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, date):
+            return value.isoformat()
+
+        text = str(value).strip()
+        try:
+            if "/" in text:
+                day, month, year = (int(part) for part in text.split("/"))
+                return date(year, month, day).isoformat()
+            return date.fromisoformat(text).isoformat()
+        except (TypeError, ValueError):
+            raise AppError("Informe a data de nascimento no formato DD/MM/AAAA.") from None
 
     def set_patient_active(self, record_id: str, active: bool) -> None:
         self.client.table("patients").update({"is_active": active}).eq("id", record_id).execute()

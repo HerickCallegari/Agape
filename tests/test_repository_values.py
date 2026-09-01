@@ -47,6 +47,22 @@ class RepositoryValueTests(unittest.TestCase):
         with self.assertRaises(AppError):
             self.repo.parse_consultation_fee("-1")
 
+    def test_patient_birth_date_accepts_brazilian_format(self):
+        self.assertEqual(
+            self.repo.normalize_patient_birth_date("19/11/2024"),
+            "2024-11-19",
+        )
+
+    def test_patient_birth_date_accepts_iso_format(self):
+        self.assertEqual(
+            self.repo.normalize_patient_birth_date("2024-11-19"),
+            "2024-11-19",
+        )
+
+    def test_invalid_patient_birth_date_has_friendly_error(self):
+        with self.assertRaisesRegex(AppError, "DD/MM/AAAA"):
+            self.repo.normalize_patient_birth_date("31/02/2024")
+
     def test_payment_money_formats(self):
         self.assertEqual(self.repo.parse_money("50"), 50.0)
         self.assertEqual(self.repo.parse_money(50.0), 50.0)
