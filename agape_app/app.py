@@ -1676,6 +1676,7 @@ class AgendaPage(QWidget):
         self._write_task_id: int | None = None
         self._allowed_to_manage = can(profile, Permission.MANAGE_AGENDA)
         self._pending_scroll_state = (0, False)
+        self._rendered_agenda_key: tuple[date, Any] | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(18)
@@ -1859,13 +1860,14 @@ class AgendaPage(QWidget):
         return self._refresh_in_progress or self._write_in_progress
 
     def _set_busy_ui(self, message: str = "") -> None:
-        busy = self.is_busy
-        self.loading_label.setText(message)
-        self.loading_label.setVisible(bool(message))
-        self.new_appointment.setEnabled(self._allowed_to_manage and not busy)
-        self.new_recurring.setEnabled(self._allowed_to_manage and not busy)
-        self.bulk_edit.setEnabled(self._allowed_to_manage and not busy)
-        self.list.setEnabled(not busy)
+        write_busy = self._write_in_progress
+        visible_message = message if write_busy else ""
+        self.loading_label.setText(visible_message)
+        self.loading_label.setVisible(bool(visible_message))
+        self.new_appointment.setEnabled(self._allowed_to_manage and not write_busy)
+        self.new_recurring.setEnabled(self._allowed_to_manage and not write_busy)
+        self.bulk_edit.setEnabled(self._allowed_to_manage and not write_busy)
+        self.list.setEnabled(not write_busy)
 
     def _apply_professionals(self, professionals: list[dict[str, Any]], preferred_id: str | None) -> None:
         self.professional_filter.blockSignals(True)
@@ -1959,8 +1961,12 @@ class AgendaPage(QWidget):
             current_key = (self.date_edit.date().toPython(), self.professional_filter.currentData())
             result_key = (result["selected"], result.get("professional_id"))
             if current_key == result_key:
-                self.rows = result["rows"]
-                self._render_rows(result["selected"])
+                new_rows = result["rows"]
+                screen_changed = self._rendered_agenda_key != result_key or self.rows != new_rows
+                self.rows = new_rows
+                if screen_changed:
+                    self._render_rows(result["selected"])
+                    self._rendered_agenda_key = result_key
                 LOGGER.info("Atualização da agenda concluída")
                 self.activity_completed.emit()
             else:
