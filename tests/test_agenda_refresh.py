@@ -16,6 +16,7 @@ from agape_app.app import (
     AppointmentDialog,
     AppointmentEditDialog,
     BulkAppointmentEditDialog,
+    DashboardPage,
     friendly_error_message,
 )
 from agape_app.repository import SupabaseRepository
@@ -25,12 +26,14 @@ class FakeAgendaRepository:
     def __init__(self):
         self.rows = []
         self.appointment_calls = 0
+        self.professional_calls = 0
         self.patient_calls = 0
         self.gate = None
         self.save_gate = None
         self.error = None
 
     def professionals(self, active_only=True):
+        self.professional_calls += 1
         return [{"id": "professional-1", "full_name": "Profissional", "profile_id": "profile-1"}]
 
     def appointments(self, selected_date, professional_id=None):
@@ -228,6 +231,80 @@ class AgendaRefreshTests(unittest.TestCase):
             self.page.refresh(show_popup=False)
             self.assertTrue(self.wait_until(lambda: not self.page.is_busy))
         self.assertEqual(getattr(self.page, "_background_workers", {}), {})
+
+    def test_admin_mode_does_not_refresh_hidden_agenda(self):
+        self.page.set_admin_mode(True)
+        self.assertEqual(self.repo.professional_calls, 0)
+        self.assertEqual(self.repo.appointment_calls, 0)
+
+
+class DashboardRefreshTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.repo = FakeAgendaRepository()
+        self.page = DashboardPage(self.repo, {"id": "profile-1", "role": "admin"})
+
+    def tearDown(self):
+        self.page.deleteLater()
+        self.app.processEvents()
+
+    def wait_until(self, predicate, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            if predicate():
+                return True
+            time.sleep(0.005)
+        return False
+
+    def test_constructor_does_not_load_hidden_data(self):
+        self.assertEqual(self.repo.professional_calls, 0)
+        self.assertEqual(self.repo.appointment_calls, 0)
+
+    def test_failed_refresh_preserves_last_successful_data(self):
+        expected = appointment("one", "08:00:00")
+        self.repo.rows = [expected]
+        self.page.refresh()
+        self.assertTrue(self.wait_until(lambda: not self.page._refresh_in_progress))
+        self.assertEqual(self.page.rows, [expected])
+
+        self.repo.error = httpx.RemoteProtocolError("Server disconnected")
+        with patch("agape_app.app.show_error") as error_popup:
+            self.page.refresh()
+            self.assertTrue(self.wait_until(lambda: not self.page._refresh_in_progress))
+
+        self.assertEqual(self.page.rows, [expected])
+        error_popup.assert_not_called()
+
+
+class RepositoryReadRetryTests(unittest.TestCase):
+    def test_transient_transport_error_is_retried(self):
+        repo = object.__new__(SupabaseRepository)
+        repo.READ_RETRY_DELAYS = (0, 0)
+        outcomes = [
+            httpx.RemoteProtocolError("Server disconnected"),
+            type("Result", (), {"data": [{"id": "ok"}]})(),
+        ]
+
+        class Query:
+            def execute(self):
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        with patch("agape_app.repository.time.sleep") as sleep:
+            result = repo._execute_read(Query)
+
+        self.assertEqual(result, [{"id": "ok"}])
+        sleep.assert_called_once_with(0)
+
+    def test_remote_protocol_error_has_friendly_message(self):
+        message = friendly_error_message(httpx.RemoteProtocolError("Server disconnected"))
+        self.assertIn("interrompida", message)
 
 
 class BulkAppointmentAsyncTests(unittest.TestCase):

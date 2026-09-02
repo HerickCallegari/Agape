@@ -3,6 +3,7 @@ import types
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 
 if "supabase" not in sys.modules:
@@ -128,6 +129,22 @@ class FakeClient:
     def rpc(self, name, payload):
         self.rpc_calls.append((name, payload))
         return FakeQuery(self.updates)
+
+
+class ProfessionalReadTests(unittest.TestCase):
+    def test_listing_professionals_does_not_synchronize_or_write(self):
+        repo = object.__new__(SupabaseRepository)
+        repo.client = FakeClient()
+
+        with patch.object(
+            repo,
+            "sync_professionals_from_profiles",
+            side_effect=AssertionError("a leitura não deve sincronizar perfis"),
+        ):
+            rows = repo.professionals()
+
+        self.assertEqual(rows, [])
+        self.assertEqual(repo.client.updates, [])
 
 
 class BulkUpdateTests(unittest.TestCase):

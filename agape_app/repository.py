@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import mimetypes
+import time
+from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ class AppError(Exception):
 
 class SupabaseRepository:
     POSTGREST_TIMEOUT = httpx.Timeout(connect=8.0, read=20.0, write=20.0, pool=5.0)
+    READ_RETRY_DELAYS = (0.2, 0.6)
     DEFAULT_PROFESSIONAL_SPECIALTY = "Outra"
     DOCUMENTS_BUCKET = "professional-documents"
     MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024
@@ -64,10 +67,18 @@ class SupabaseRepository:
         if not settings.is_configured:
             raise AppError("Configure SUPABASE_URL e SUPABASE_ANON_KEY no arquivo .env.")
         self.settings = settings
+        self._http_client = httpx.Client(
+            http1=True,
+            http2=False,
+            timeout=self.POSTGREST_TIMEOUT,
+        )
         self.client: Client = create_client(
             settings.supabase_url,
             settings.supabase_anon_key,
-            options=ClientOptions(postgrest_client_timeout=self.POSTGREST_TIMEOUT),
+            options=ClientOptions(
+                postgrest_client_timeout=self.POSTGREST_TIMEOUT,
+                httpx_client=self._http_client,
+            ),
         )
         self.user = None
         self.access_token: str | None = None
@@ -79,6 +90,16 @@ class SupabaseRepository:
             cleaned[index : index + self.SUPABASE_IN_FILTER_BATCH_SIZE]
             for index in range(0, len(cleaned), self.SUPABASE_IN_FILTER_BATCH_SIZE)
         ]
+
+    def _execute_read(self, query_factory: Callable[[], Any]) -> Any:
+        """Executa uma leitura novamente quando a conexão cai antes da resposta."""
+        for attempt in range(len(self.READ_RETRY_DELAYS) + 1):
+            try:
+                return query_factory().execute().data
+            except httpx.TransportError:
+                if attempt >= len(self.READ_RETRY_DELAYS):
+                    raise
+                time.sleep(self.READ_RETRY_DELAYS[attempt])
 
     def login(self, email: str, password: str) -> dict[str, Any]:
         try:
@@ -108,12 +129,15 @@ class SupabaseRepository:
         self.profile = None
 
     def patients(self, search: str = "", active_only: bool = True) -> list[dict[str, Any]]:
-        query = self.client.table("patients").select("*").order("full_name")
-        if active_only:
-            query = query.eq("is_active", True)
-        if search:
-            query = query.ilike("full_name", f"%{search}%")
-        return query.execute().data or []
+        def build_query():
+            query = self.client.table("patients").select("*").order("full_name")
+            if active_only:
+                query = query.eq("is_active", True)
+            if search:
+                query = query.ilike("full_name", f"%{search}%")
+            return query
+
+        return self._execute_read(build_query) or []
 
     def save_patient(self, values: dict[str, Any], record_id: str | None = None) -> None:
         if not values.get("full_name", "").strip():
@@ -167,15 +191,18 @@ class SupabaseRepository:
         """Returns only the professionals available to the signed-in user for exports."""
         if not self.profile:
             return []
-        query = (
-            self.client.table("professionals")
-            .select("id, full_name, profile_id")
-            .eq("is_active", True)
-            .order("full_name")
-        )
-        if self.profile.get("role") != "admin":
-            query = query.eq("profile_id", self.profile.get("id"))
-        return query.execute().data or []
+        def build_query():
+            query = (
+                self.client.table("professionals")
+                .select("id, full_name, profile_id")
+                .eq("is_active", True)
+                .order("full_name")
+            )
+            if self.profile.get("role") != "admin":
+                query = query.eq("profile_id", self.profile.get("id"))
+            return query
+
+        return self._execute_read(build_query) or []
 
     def patient_session_exports(
         self,
@@ -224,13 +251,15 @@ class SupabaseRepository:
         return rows
 
     def professionals(self, search: str = "", active_only: bool = True) -> list[dict[str, Any]]:
-        self.sync_professionals_from_profiles()
-        query = self.client.table("professionals").select("*, profiles(full_name, auth_user_id, role, can_attend)").order("full_name")
-        if active_only:
-            query = query.eq("is_active", True)
-        if search:
-            query = query.ilike("full_name", f"%{search}%")
-        rows = query.execute().data or []
+        def build_query():
+            query = self.client.table("professionals").select("*, profiles(full_name, auth_user_id, role, can_attend)").order("full_name")
+            if active_only:
+                query = query.eq("is_active", True)
+            if search:
+                query = query.ilike("full_name", f"%{search}%")
+            return query
+
+        rows = self._execute_read(build_query) or []
         filtered = []
         seen_profiles = set()
         for row in rows:
@@ -565,18 +594,21 @@ class SupabaseRepository:
         return payload
 
     def appointments(self, selected_date: date, professional_id: str | None = None) -> list[dict[str, Any]]:
-        query = (
-            self.client.table("appointments")
-            .select("*, patients(full_name, guardian_name, guardian_phone, reason_for_care, general_notes), professionals(full_name, profile_id)")
-            .eq("appointment_date", selected_date.isoformat())
-            .order("start_time")
-            .order("end_time")
-            .order("professional_id")
-            .order("id")
-        )
-        if professional_id:
-            query = query.eq("professional_id", professional_id)
-        rows = query.execute().data or []
+        def build_query():
+            query = (
+                self.client.table("appointments")
+                .select("*, patients(full_name, guardian_name, guardian_phone, reason_for_care, general_notes), professionals(full_name, profile_id)")
+                .eq("appointment_date", selected_date.isoformat())
+                .order("start_time")
+                .order("end_time")
+                .order("professional_id")
+                .order("id")
+            )
+            if professional_id:
+                query = query.eq("professional_id", professional_id)
+            return query
+
+        rows = self._execute_read(build_query) or []
         if self.profile and self.profile.get("role") == "professional":
             profs = self.professionals(active_only=False)
             allowed = {p["id"] for p in profs if p.get("profile_id") == self.profile["id"]}

@@ -249,6 +249,8 @@ def friendly_error_message(exc: Exception) -> str:
         return "O servidor demorou para responder. Verifique sua conexão e tente novamente."
     if isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
         return "Não foi possível conectar ao servidor. Verifique sua conexão e tente novamente."
+    if isinstance(exc, httpx.TransportError):
+        return "A conexão com o servidor foi interrompida. O sistema tentará novamente automaticamente."
     if "JSON could not be generated" in raw or "Bad Request" in raw:
         return (
             "Não foi possível atualizar alguns dados agora. "
@@ -655,7 +657,7 @@ class MainWindow(QMainWindow):
         self.set_active_nav(0)
         QTimer.singleShot(0, self.refresh_initial_page)
         self.auto_refresh_timer = QTimer(self)
-        self.auto_refresh_timer.setInterval(10_000)
+        self.auto_refresh_timer.setInterval(30_000)
         self.auto_refresh_timer.timeout.connect(self.auto_refresh_current_page)
         self.agenda_page.activity_completed.connect(self.restart_auto_refresh_timer)
         self.auto_refresh_timer.start()
@@ -673,6 +675,9 @@ class MainWindow(QMainWindow):
     def set_admin_mode(self, enabled: bool) -> None:
         self.agenda_page.set_admin_mode(enabled)
         self.dashboard_page.set_admin_mode(enabled)
+        current_page = self.stack.currentWidget()
+        if current_page in (self.agenda_page, self.dashboard_page):
+            self.safe_refresh_page(current_page, show_popup=False)
 
     def set_active_nav(self, index: int) -> None:
         for idx, nav in enumerate(self.nav_buttons):
@@ -725,6 +730,10 @@ class DashboardPage(QWidget):
         self.navigate = navigate
         self.admin_mode_enabled = profile.get("role") == "reception"
         self.professionals: list[dict[str, Any]] = []
+        self.rows: list[dict[str, Any]] = []
+        self._refresh_in_progress = False
+        self._refresh_pending = False
+        self._refresh_task_id: int | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(18)
@@ -761,7 +770,6 @@ class DashboardPage(QWidget):
         if self.profile.get("role") != "admin":
             return
         self.admin_mode_enabled = enabled
-        self.refresh()
 
     def can_view_all_agendas(self) -> bool:
         return self.profile.get("role") == "reception" or (
@@ -783,17 +791,52 @@ class DashboardPage(QWidget):
             "Faltas": sum(1 for row in rows if row["status"] in {"Falta com aviso", "Falta sem aviso"}),
         }
 
-    def refresh(self) -> None:
+    def _fetch_dashboard(self) -> dict[str, Any]:
         today = date.today()
+        professionals = self.repo.professionals(active_only=True)
+        can_view_all = self.can_view_all_agendas()
+        professional_id = None
+        if not can_view_all:
+            professional_id = next(
+                (
+                    professional.get("id")
+                    for professional in professionals
+                    if professional.get("profile_id") == self.profile.get("id")
+                ),
+                None,
+            )
+        rows = [] if not can_view_all and professional_id is None else self.repo.appointments(today, professional_id)
+        return {"professionals": professionals, "rows": rows}
+
+    def refresh(self) -> None:
+        if self._refresh_in_progress:
+            self._refresh_pending = True
+            return
+        self._refresh_in_progress = True
+        self._refresh_task_id = start_worker(self, self._on_refresh_completed, self._fetch_dashboard)
+
+    @Slot(object, object, object)
+    def _on_refresh_completed(self, task_id: int, result: dict[str, Any] | None, error: Exception | None) -> None:
+        forget_worker(self, task_id)
+        if task_id != self._refresh_task_id:
+            return
+        self._refresh_task_id = None
+        self._refresh_in_progress = False
+        if error is not None:
+            log_exception("Falha ao atualizar painel inicial", error)
+        elif result is not None:
+            self.professionals = result["professionals"]
+            self.rows = result["rows"]
+            self._render_dashboard()
+        pending = self._refresh_pending
+        self._refresh_pending = False
+        if pending:
+            self.refresh()
+
+    def _render_dashboard(self) -> None:
+        rows = self.rows
+        counts = self.dashboard_counts(rows)
         clear_layout(self.grid)
-        try:
-            self.professionals = self.repo.professionals(active_only=True)
-            professional_id = None if self.can_view_all_agendas() else self.own_professional_id()
-            rows = [] if not self.can_view_all_agendas() and professional_id is None else self.repo.appointments(today, professional_id)
-            counts = self.dashboard_counts(rows)
-        except Exception:
-            counts = {"Atendimentos": 0, "Confirmados": 0, "Atendidos": 0, "Faltas": 0}
-            rows = []
         for col, (label, count) in enumerate(counts.items()):
             item = card()
             item.setMinimumHeight(110)
@@ -1341,8 +1384,6 @@ class SessionExportPage(QWidget):
         layout.addWidget(subtitle)
         layout.addWidget(filters_panel)
         layout.addLayout(content, 1)
-        self.load_patients()
-        self.load_professionals()
 
     def filter_field(self, label: str, widget: QWidget) -> QVBoxLayout:
         box = QVBoxLayout()
@@ -1849,7 +1890,6 @@ class AgendaPage(QWidget):
             return
         self.admin_mode_enabled = enabled
         self.professionals_loaded = False
-        self.refresh()
 
     def can_view_all_agendas(self) -> bool:
         return self.profile.get("role") == "reception" or (
