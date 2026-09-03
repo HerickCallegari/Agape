@@ -291,8 +291,9 @@ class SupabaseRepository:
             return
 
         rows = self.client.table("professionals").select("id").eq("profile_id", profile["id"]).execute().data or []
+        full_name = profile.get("full_name", "").strip() or "Profissional"
         payload = {
-            "full_name": profile.get("full_name", "").strip() or "Profissional",
+            "full_name": full_name,
             "specialty": profile.get("specialty") or self.DEFAULT_PROFESSIONAL_SPECIALTY,
             "phone": profile.get("phone", "") or "",
             "is_active": profile.get("is_active", True) and profile.get("can_attend", False),
@@ -301,6 +302,26 @@ class SupabaseRepository:
             self.client.table("professionals").update(payload).eq("profile_id", profile["id"]).execute()
             return
 
+        candidates = (
+            self.client.table("professionals")
+            .select("id, full_name, profile_id")
+            .ilike("full_name", full_name)
+            .execute()
+            .data
+            or []
+        )
+        unlinked_matches = [
+            row
+            for row in candidates
+            if not row.get("profile_id")
+            and str(row.get("full_name") or "").strip().casefold() == full_name.casefold()
+        ]
+        if len(unlinked_matches) > 1:
+            raise AppError(
+                "Existem vários profissionais sem login com este nome. "
+                "Vincule o usuário manualmente antes de continuar."
+            )
+
         payload.update(
             {
                 "profile_id": profile["id"],
@@ -308,6 +329,10 @@ class SupabaseRepository:
                 "phone": profile.get("phone", "") or "",
             }
         )
+        if unlinked_matches:
+            self.client.table("professionals").update(payload).eq("id", unlinked_matches[0]["id"]).execute()
+            return
+
         self.client.table("professionals").insert(payload).execute()
 
     def save_professional(self, values: dict[str, Any], record_id: str | None = None) -> None:
@@ -594,6 +619,9 @@ class SupabaseRepository:
         return payload
 
     def appointments(self, selected_date: date, professional_id: str | None = None) -> list[dict[str, Any]]:
+        if self.profile and self.profile.get("role") == "professional" and not professional_id:
+            return []
+
         def build_query():
             query = (
                 self.client.table("appointments")
@@ -608,12 +636,7 @@ class SupabaseRepository:
                 query = query.eq("professional_id", professional_id)
             return query
 
-        rows = self._execute_read(build_query) or []
-        if self.profile and self.profile.get("role") == "professional":
-            profs = self.professionals(active_only=False)
-            allowed = {p["id"] for p in profs if p.get("profile_id") == self.profile["id"]}
-            rows = [row for row in rows if row.get("professional_id") in allowed]
-        return rows
+        return self._execute_read(build_query) or []
 
     def dashboard_counts(self, selected_date: date) -> dict[str, int]:
         rows = self.appointments(selected_date)

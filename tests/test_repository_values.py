@@ -147,6 +147,151 @@ class ProfessionalReadTests(unittest.TestCase):
         self.assertEqual(repo.client.updates, [])
 
 
+class ProfessionalProfileLinkTests(unittest.TestCase):
+    class Query:
+        def __init__(self, client):
+            self.client = client
+            self.filters = []
+            self.operation = "select"
+            self.payload = None
+
+        def select(self, *_args): return self
+        def eq(self, column, value):
+            self.filters.append(("eq", column, value))
+            return self
+        def ilike(self, column, value):
+            self.filters.append(("ilike", column, value))
+            return self
+        def update(self, payload):
+            self.operation = "update"
+            self.payload = payload
+            return self
+        def insert(self, payload):
+            self.operation = "insert"
+            self.payload = payload
+            return self
+        def execute(self):
+            if self.operation == "update":
+                self.client.updates.append((self.payload, list(self.filters)))
+                data = []
+            elif self.operation == "insert":
+                self.client.inserts.append(self.payload)
+                data = []
+            elif any(item[0] == "ilike" for item in self.filters):
+                data = list(self.client.name_candidates)
+            else:
+                data = list(self.client.profile_matches)
+            return type("Result", (), {"data": data})()
+
+    class Client:
+        def __init__(self, profile_matches=None, name_candidates=None):
+            self.profile_matches = profile_matches or []
+            self.name_candidates = name_candidates or []
+            self.updates = []
+            self.inserts = []
+
+        def table(self, _name):
+            return ProfessionalProfileLinkTests.Query(self)
+
+    def setUp(self):
+        self.profile = {
+            "id": "profile-1",
+            "full_name": "Thiago Silva",
+            "specialty": "Psicologa",
+            "phone": "",
+            "is_active": True,
+            "can_attend": True,
+        }
+        self.repo = object.__new__(SupabaseRepository)
+
+    def test_existing_unlinked_professional_is_adopted_instead_of_duplicated(self):
+        self.repo.client = self.Client(
+            name_candidates=[
+                {"id": "professional-history", "full_name": " thiago silva ", "profile_id": None}
+            ]
+        )
+
+        self.repo.ensure_professional_for_profile(self.profile)
+
+        self.assertEqual(self.repo.client.inserts, [])
+        self.assertEqual(len(self.repo.client.updates), 1)
+        payload, filters = self.repo.client.updates[0]
+        self.assertEqual(payload["profile_id"], "profile-1")
+        self.assertIn(("eq", "id", "professional-history"), filters)
+
+    def test_ambiguous_unlinked_professionals_are_not_duplicated(self):
+        self.repo.client = self.Client(
+            name_candidates=[
+                {"id": "professional-1", "full_name": "Thiago Silva", "profile_id": None},
+                {"id": "professional-2", "full_name": "THIAGO SILVA", "profile_id": None},
+            ]
+        )
+
+        with self.assertRaisesRegex(AppError, "vários profissionais"):
+            self.repo.ensure_professional_for_profile(self.profile)
+
+        self.assertEqual(self.repo.client.inserts, [])
+        self.assertEqual(self.repo.client.updates, [])
+
+
+class ProfessionalAppointmentVisibilityTests(unittest.TestCase):
+    class AppointmentQuery:
+        def __init__(self, client):
+            self.client = client
+
+        def select(self, *_args): return self
+        def eq(self, *_args): return self
+        def order(self, *_args, **_kwargs): return self
+
+        def execute(self):
+            self.client.executions += 1
+            return type("Result", (), {"data": list(self.client.rows)})()
+
+    class AppointmentClient:
+        def __init__(self, rows):
+            self.rows = rows
+            self.executions = 0
+
+        def table(self, _name):
+            return ProfessionalAppointmentVisibilityTests.AppointmentQuery(self)
+
+    def setUp(self):
+        self.row = {
+            "id": "appointment-1",
+            "professional_id": "professional-1",
+            "appointment_date": "2026-09-02",
+        }
+        self.repo = object.__new__(SupabaseRepository)
+        self.repo.profile = {"id": "profile-1", "role": "professional"}
+        self.repo.client = self.AppointmentClient([self.row])
+
+    def test_explicit_own_professional_query_is_not_discarded_by_second_lookup(self):
+        with patch.object(
+            self.repo,
+            "professionals",
+            side_effect=AssertionError("não deve consultar profissionais novamente"),
+        ):
+            rows = self.repo.appointments(date(2026, 9, 2), "professional-1")
+
+        self.assertEqual(rows, [self.row])
+        self.assertEqual(self.repo.client.executions, 1)
+
+    def test_professional_without_resolved_link_does_not_query_all_appointments(self):
+        rows = self.repo.appointments(date(2026, 9, 2), None)
+        self.assertEqual(rows, [])
+        self.assertEqual(self.repo.client.executions, 0)
+
+    def test_migration_repairs_profile_link_and_enforces_unique_profile(self):
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "supabase_migration_20260903_professional_profile_repair.sql"
+        ).read_text(encoding="utf-8")
+        self.assertIn("v_history_professional_id", migration)
+        self.assertIn("v_empty_professional_id", migration)
+        self.assertNotIn("delete from public.professionals", migration.lower())
+        self.assertIn("create unique index if not exists uq_professionals_profile_id", migration)
+
+
 class BulkUpdateTests(unittest.TestCase):
     def setUp(self):
         self.repo = object.__new__(SupabaseRepository)

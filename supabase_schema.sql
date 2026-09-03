@@ -205,6 +205,10 @@ create unique index if not exists idx_appointments_professional_slot
 on public.appointments (professional_id, appointment_date, start_time, end_time)
 where status <> 'Cancelado';
 
+create unique index if not exists uq_professionals_profile_id
+on public.professionals (profile_id)
+where profile_id is not null;
+
 create index if not exists idx_patient_payments_patient_date
 on public.patient_payments (patient_id, payment_date);
 
