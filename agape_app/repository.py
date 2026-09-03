@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from postgrest.exceptions import APIError
 from supabase import Client, ClientOptions, create_client
 
 from .config import Settings
@@ -22,6 +23,10 @@ class SupabaseRepository:
     POSTGREST_TIMEOUT = httpx.Timeout(connect=8.0, read=20.0, write=20.0, pool=5.0)
     READ_RETRY_DELAYS = (0.2, 0.6)
     DEFAULT_PROFESSIONAL_SPECIALTY = "Outra"
+    DEFAULT_AGENDA_START_TIME = "08:00:00"
+    DEFAULT_AGENDA_END_TIME = "18:00:00"
+    DEFAULT_AGENDA_SLOT_MINUTES = 60
+    DEFAULT_AGENDA_STEP_MINUTES = 60
     DOCUMENTS_BUCKET = "professional-documents"
     MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024
     SUPABASE_IN_FILTER_BATCH_SIZE = 75
@@ -273,6 +278,63 @@ class SupabaseRepository:
             filtered.append(row)
         return filtered
 
+    def professional_for_profile(self, profile_id: str) -> dict[str, Any] | None:
+        try:
+            rows = (
+                self.client.table("professionals")
+                .select("id, agenda_start_time, agenda_end_time, agenda_slot_minutes, agenda_step_minutes")
+                .eq("profile_id", profile_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        except APIError as exc:
+            if getattr(exc, "code", None) not in {"42703", "PGRST204"}:
+                raise
+            # Compatibilidade durante a implantação: preserva os três campos da
+            # primeira versão até a migração com agenda_step_minutes ser aplicada.
+            rows = (
+                self.client.table("professionals")
+                .select("id, agenda_start_time, agenda_end_time, agenda_slot_minutes")
+                .eq("profile_id", profile_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        return rows[0] if rows else None
+
+    def professional_agenda_values(self, values: dict[str, Any]) -> dict[str, Any]:
+        agenda_start_time = values.get("agenda_start_time", self.DEFAULT_AGENDA_START_TIME)
+        agenda_end_time = values.get("agenda_end_time", self.DEFAULT_AGENDA_END_TIME)
+        try:
+            agenda_slot_minutes = int(values.get("agenda_slot_minutes", self.DEFAULT_AGENDA_SLOT_MINUTES))
+        except (TypeError, ValueError):
+            raise AppError("Informe durações válidas para os horários da grade.") from None
+        try:
+            agenda_step_minutes = int(
+                values.get("agenda_step_minutes") or max(self.DEFAULT_AGENDA_STEP_MINUTES, agenda_slot_minutes)
+            )
+        except (TypeError, ValueError):
+            raise AppError("Informe durações válidas para os horários da grade.") from None
+        if agenda_end_time <= agenda_start_time:
+            raise AppError("O horário final da grade deve ser maior que o horário inicial.")
+        if not 5 <= agenda_slot_minutes <= 480:
+            raise AppError("A duração dos horários deve ficar entre 5 e 480 minutos.")
+        if not agenda_slot_minutes <= agenda_step_minutes <= 480:
+            raise AppError("O intervalo entre novos horários não pode ser menor que a duração do atendimento.")
+        return {
+            "agenda_start_time": agenda_start_time,
+            "agenda_end_time": agenda_end_time,
+            "agenda_slot_minutes": agenda_slot_minutes,
+            "agenda_step_minutes": agenda_step_minutes,
+        }
+
+    def save_professional_agenda_for_profile(self, profile_id: str, values: dict[str, Any]) -> None:
+        payload = self.professional_agenda_values(values)
+        self.client.table("professionals").update(payload).eq("profile_id", profile_id).execute()
+
     def sync_professionals_from_profiles(self) -> None:
         profiles = (
             self.client.table("profiles")
@@ -338,6 +400,10 @@ class SupabaseRepository:
     def save_professional(self, values: dict[str, Any], record_id: str | None = None) -> None:
         if not values.get("full_name", "").strip():
             raise AppError("Preencha o nome do profissional antes de salvar.")
+        values = {
+            **values,
+            **self.professional_agenda_values(values),
+        }
         profile_id = values.get("profile_id")
         if not profile_id:
             raise AppError("Vincule o profissional a um usuário com permissão Profissional.")
@@ -487,6 +553,8 @@ class SupabaseRepository:
             raise AppError("A senha deve ter pelo menos 6 caracteres.")
         if role not in {"admin", "reception", "professional"}:
             raise AppError("Escolha uma permissão válida para o usuário.")
+        if values.get("can_attend"):
+            self.professional_agenda_values(values)
 
         try:
             response = httpx.post(
@@ -527,6 +595,7 @@ class SupabaseRepository:
         profile = created[0] if created else profile_payload
         if profile.get("can_attend"):
             self.ensure_professional_for_profile(profile)
+            self.save_professional_agenda_for_profile(profile["id"], values)
         return profile
 
     def send_password_reset(self, email: str) -> None:
@@ -588,6 +657,8 @@ class SupabaseRepository:
             raise AppError("Preencha o nome do usuário antes de salvar.")
         if role not in {"admin", "reception", "professional"}:
             raise AppError("Escolha uma permissão válida para o usuário.")
+        if values.get("can_attend"):
+            self.professional_agenda_values(values)
         payload = {
             "full_name": full_name,
             "email": values.get("email", "").strip(),
@@ -605,6 +676,8 @@ class SupabaseRepository:
                 **self.employee_profile_payload(values),
             }
         )
+        if values.get("can_attend"):
+            self.save_professional_agenda_for_profile(profile_id, values)
 
     def delete_profile(self, profile_id: str) -> None:
         if self.profile and self.profile.get("id") == profile_id:
@@ -660,7 +733,6 @@ class SupabaseRepository:
             .select("id")
             .eq("professional_id", professional_id)
             .eq("appointment_date", appointment_date)
-            .neq("status", "Cancelado")
             .lt("start_time", end_time)
             .gt("end_time", start_time)
             .execute()
@@ -767,7 +839,6 @@ class SupabaseRepository:
                 .select("id")
                 .eq("professional_id", target["professional_id"])
                 .eq("appointment_date", target["appointment_date"])
-                .neq("status", "Cancelado")
                 .lt("start_time", target["end_time"])
                 .gt("end_time", target["start_time"])
                 .execute()
@@ -784,11 +855,7 @@ class SupabaseRepository:
             changes.append((row, payload, target))
 
         for index, (row, _payload, target) in enumerate(changes):
-            if target["status"] == "Cancelado":
-                continue
             for other_row, _other_payload, other_target in changes[index + 1 :]:
-                if other_target["status"] == "Cancelado":
-                    continue
                 if (
                     target["professional_id"] == other_target["professional_id"]
                     and target["appointment_date"] == other_target["appointment_date"]

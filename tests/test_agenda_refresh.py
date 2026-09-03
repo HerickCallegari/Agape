@@ -9,14 +9,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import httpx
 from PySide6.QtCore import QThreadPool
-from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QWidget
 
 from agape_app.app import (
+    AGENDA_KIND,
     AgendaPage,
     AppointmentDialog,
     AppointmentEditDialog,
     BulkAppointmentEditDialog,
     DashboardPage,
+    RecurringDialog,
+    build_agenda_grid_rows,
     friendly_error_message,
 )
 from agape_app.repository import SupabaseRepository
@@ -34,7 +37,15 @@ class FakeAgendaRepository:
 
     def professionals(self, active_only=True):
         self.professional_calls += 1
-        return [{"id": "professional-1", "full_name": "Profissional", "profile_id": "profile-1"}]
+        return [{
+            "id": "professional-1",
+            "full_name": "Profissional",
+            "profile_id": "profile-1",
+            "agenda_start_time": "08:00:00",
+            "agenda_end_time": "18:00:00",
+            "agenda_slot_minutes": 60,
+            "agenda_step_minutes": 60,
+        }]
 
     def appointments(self, selected_date, professional_id=None):
         self.appointment_calls += 1
@@ -94,17 +105,200 @@ class FakeAgendaRepository:
 
 
 def appointment(identifier: str, start_time: str) -> dict:
+    start_hour = int(start_time[:2])
+    end_time = f"{start_hour + 1:02d}:{start_time[3:5]}:00"
     return {
         "id": identifier,
         "patient_id": f"patient-{identifier}",
         "professional_id": "professional-1",
         "appointment_date": date.today().isoformat(),
         "start_time": start_time,
-        "end_time": "12:00:00",
+        "end_time": end_time,
         "status": "Agendado",
         "patients": {"full_name": f"Paciente {identifier}"},
         "professionals": {"full_name": "Profissional", "profile_id": "profile-1"},
     }
+
+
+class AgendaGridRuleTests(unittest.TestCase):
+    def setUp(self):
+        self.professional = {
+            "id": "professional-1",
+            "full_name": "Profissional",
+            "agenda_start_time": "08:00:00",
+            "agenda_end_time": "12:00:00",
+            "agenda_slot_minutes": 60,
+            "agenda_step_minutes": 60,
+        }
+
+    def test_empty_day_is_rendered_as_free_slots(self):
+        rows = build_agenda_grid_rows([self.professional], [])
+
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row[AGENDA_KIND] == "free" for row in rows))
+        self.assertEqual(rows[0]["start_time"], "08:00:00")
+        self.assertEqual(rows[-1]["end_time"], "12:00:00")
+
+    def test_appointment_marks_overlapping_slot_as_occupied(self):
+        row = appointment("one", "09:00:00")
+
+        rows = build_agenda_grid_rows([self.professional], [row])
+
+        self.assertEqual(
+            [item[AGENDA_KIND] for item in rows],
+            ["free", "appointment", "free", "free"],
+        )
+
+    def test_cancelled_appointment_remains_occupied_with_cancelled_status(self):
+        row = appointment("cancelled", "09:00:00")
+        row["status"] = "Cancelado"
+
+        rows = build_agenda_grid_rows([self.professional], [row])
+
+        self.assertEqual(
+            [item[AGENDA_KIND] for item in rows],
+            ["free", "appointment", "free", "free"],
+        )
+        cancelled = next(item for item in rows if item[AGENDA_KIND] == "appointment")
+        self.assertEqual(cancelled["status"], "Cancelado")
+        self.assertEqual(cancelled["id"], "cancelled")
+
+    def test_existing_appointment_outside_grid_remains_visible(self):
+        row = appointment("early", "07:00:00")
+
+        rows = build_agenda_grid_rows([self.professional], [row])
+
+        occupied = [item for item in rows if item[AGENDA_KIND] == "appointment"]
+        self.assertEqual(len(occupied), 1)
+        self.assertEqual(occupied[0]["id"], "early")
+
+    def test_fifty_minute_appointments_can_start_every_hour_without_drifting(self):
+        self.professional.update({"agenda_slot_minutes": 50, "agenda_step_minutes": 60})
+        row = appointment("fifty", "09:00:00")
+        row["end_time"] = "09:50:00"
+
+        rows = build_agenda_grid_rows([self.professional], [row])
+
+        self.assertEqual([item["start_time"] for item in rows], [
+            "08:00:00", "09:00:00", "10:00:00", "11:00:00"
+        ])
+        self.assertEqual(rows[0]["end_time"], "08:50:00")
+        occupied = [item for item in rows if item[AGENDA_KIND] == "appointment"]
+        self.assertEqual(len(occupied), 1)
+        self.assertEqual(occupied[0]["end_time"], "09:50:00")
+
+    def test_non_aligned_appointment_appears_once_and_blocks_every_overlap(self):
+        row = appointment("offset", "08:00:00")
+        row["start_time"] = "08:30:00"
+        row["end_time"] = "09:30:00"
+
+        rows = build_agenda_grid_rows([self.professional], [row])
+
+        occupied = [item for item in rows if item[AGENDA_KIND] == "appointment"]
+        free_starts = [item["start_time"] for item in rows if item[AGENDA_KIND] == "free"]
+        self.assertEqual(len(occupied), 1)
+        self.assertEqual(free_starts, ["10:00:00", "11:00:00"])
+
+    def test_building_grid_does_not_mutate_existing_appointment(self):
+        row = appointment("unchanged", "09:00:00")
+        original = {**row, "patients": dict(row["patients"]), "professionals": dict(row["professionals"])}
+
+        build_agenda_grid_rows([self.professional], [row])
+
+        self.assertEqual(row, original)
+
+    def test_free_slots_can_be_hidden_without_hiding_appointments(self):
+        row = appointment("visible", "09:00:00")
+
+        rows = build_agenda_grid_rows(
+            [self.professional],
+            [row],
+            include_free_slots=False,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][AGENDA_KIND], "appointment")
+        self.assertEqual(rows[0]["id"], "visible")
+
+
+class AppointmentDurationDefaultsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.parent = QWidget()
+        self.patients = [{"id": "patient-1", "full_name": "Paciente"}]
+        self.professionals = [
+            {
+                "id": "professional-40",
+                "full_name": "Profissional 40",
+                "agenda_start_time": "08:00:00",
+                "agenda_end_time": "17:40:00",
+                "agenda_slot_minutes": 40,
+                "agenda_step_minutes": 60,
+            },
+            {
+                "id": "professional-50",
+                "full_name": "Profissional 50",
+                "agenda_start_time": "09:00:00",
+                "agenda_end_time": "17:50:00",
+                "agenda_slot_minutes": 50,
+                "agenda_step_minutes": 60,
+            },
+        ]
+
+    def tearDown(self):
+        self.parent.deleteLater()
+        self.app.processEvents()
+
+    def test_new_appointment_uses_selected_professional_duration(self):
+        dialog = AppointmentDialog(
+            self.parent,
+            object(),
+            date.today(),
+            patients=self.patients,
+            professionals=self.professionals,
+            selected_professional_id="professional-50",
+        )
+
+        values = dialog.values()
+
+        self.assertEqual(values["start_time"], "09:00:00")
+        self.assertEqual(values["end_time"], "09:50:00")
+        dialog.deleteLater()
+
+    def test_switching_professional_updates_default_start_and_duration(self):
+        dialog = AppointmentDialog(
+            self.parent,
+            object(),
+            date.today(),
+            patients=self.patients,
+            professionals=self.professionals,
+            selected_professional_id="professional-50",
+        )
+
+        dialog.professional.setCurrentIndex(dialog.professional.findData("professional-40"))
+        values = dialog.values()
+
+        self.assertEqual(values["start_time"], "08:00:00")
+        self.assertEqual(values["end_time"], "08:40:00")
+        dialog.deleteLater()
+
+    def test_recurring_schedule_uses_selected_professional_duration(self):
+        dialog = RecurringDialog(
+            self.parent,
+            object(),
+            patients=self.patients,
+            professionals=self.professionals,
+            selected_professional_id="professional-40",
+        )
+
+        values = dialog.values()
+
+        self.assertEqual(values["start_time"], "08:00:00")
+        self.assertEqual(values["end_time"], "08:40:00")
+        dialog.deleteLater()
 
 
 class AgendaRefreshTests(unittest.TestCase):
@@ -140,27 +334,91 @@ class AgendaRefreshTests(unittest.TestCase):
         original_widgets = {
             self.page.list.item(index).data(256)["id"]: self.page.list.itemWidget(self.page.list.item(index))
             for index in range(self.page.list.count())
+            if self.page.list.item(index).data(256).get(AGENDA_KIND) == "appointment"
         }
 
         self.repo.rows.insert(1, appointment("middle", "09:00:00"))
         self.page.refresh()
         self.assertTrue(self.wait_until(lambda: not self.page.is_busy))
 
-        ids = [self.page.list.item(index).data(256)["id"] for index in range(self.page.list.count())]
+        ids = [
+            self.page.list.item(index).data(256)["id"]
+            for index in range(self.page.list.count())
+            if self.page.list.item(index).data(256).get(AGENDA_KIND) == "appointment"
+        ]
         self.assertEqual(ids, ["first", "middle", "last"])
         self.assertIs(self.page.list.itemWidget(self.page.list.item(0)), original_widgets["first"])
         self.assertIs(self.page.list.itemWidget(self.page.list.item(2)), original_widgets["last"])
 
-    def test_first_appointment_replaces_empty_card(self):
+    def test_first_appointment_replaces_free_slot(self):
+        self.page.professionals = self.repo.professionals()
+        self.page.professionals_loaded = True
+        self.page._apply_professionals(self.page.professionals, "professional-1")
         self.page.refresh(show_popup=False)
         self.assertTrue(self.wait_until(lambda: not self.page.is_busy))
-        self.assertEqual(self.page.list.count(), 1)
-        self.assertIsNone(self.page.list.item(0).data(256))
+        self.assertEqual(self.page.list.count(), 10)
+        self.assertEqual(self.page.list.item(0).data(256)[AGENDA_KIND], "free")
 
         self.repo.rows = [appointment("first", "08:00:00")]
         self.page.refresh(show_popup=False)
         self.assertTrue(self.wait_until(lambda: not self.page.is_busy))
+        self.assertEqual(self.page.list.item(0).data(256)[AGENDA_KIND], "appointment")
         self.assertEqual(self.page.list.item(0).data(256)["id"], "first")
+
+    def test_occupied_card_displays_real_appointment_time(self):
+        row = appointment("fifty", "09:00:00")
+        row["end_time"] = "09:50:00"
+        self.repo.rows = [row]
+
+        self.page.refresh(show_popup=False)
+        self.assertTrue(self.wait_until(lambda: not self.page.is_busy))
+
+        occupied_item = next(
+            self.page.list.item(index)
+            for index in range(self.page.list.count())
+            if self.page.list.item(index).data(256).get(AGENDA_KIND) == "appointment"
+        )
+        card = self.page.list.itemWidget(occupied_item)
+        displayed_texts = [label.text() for label in card.findChildren(QLabel)]
+        self.assertIn("09:00\n09:50", displayed_texts)
+
+    def test_free_slot_opens_prefilled_appointment_form(self):
+        self.page.professionals = self.repo.professionals()
+        self.page.professionals_loaded = True
+        self.page._apply_professionals(self.page.professionals, "professional-1")
+        self.page.refresh(show_popup=False)
+        self.assertTrue(self.wait_until(lambda: not self.page.is_busy))
+        slot = self.page.list.item(2).data(256)
+        captured = {}
+
+        class InspectDialog:
+            def __init__(self, _parent, _repo, _selected_date, **kwargs):
+                captured.update(kwargs)
+
+            def exec(self):
+                return 0
+
+        with patch("agape_app.app.AppointmentDialog", InspectDialog):
+            self.page.create_appointment(slot)
+            self.assertTrue(self.wait_until(lambda: not self.page.is_busy))
+
+        self.assertEqual(captured["selected_professional_id"], "professional-1")
+        self.assertEqual(captured["selected_start_time"], "10:00:00")
+        self.assertEqual(captured["selected_end_time"], "11:00:00")
+
+    def test_all_professionals_hides_free_slots(self):
+        self.repo.rows = [appointment("visible", "09:00:00")]
+
+        self.page.refresh(show_popup=False)
+        self.assertTrue(self.wait_until(lambda: not self.page.is_busy))
+
+        rendered_rows = [
+            self.page.list.item(index).data(256)
+            for index in range(self.page.list.count())
+        ]
+        self.assertEqual(len(rendered_rows), 1)
+        self.assertEqual(rendered_rows[0][AGENDA_KIND], "appointment")
+        self.assertEqual(rendered_rows[0]["id"], "visible")
 
     def test_refresh_is_single_flight_and_runs_one_pending_request(self):
         self.repo.gate = threading.Event()
@@ -422,6 +680,26 @@ class IndividualAppointmentAsyncTests(unittest.TestCase):
             self.assertEqual(repo.individual_delete_calls, 1)
             repo.gate.set()
             self.assertTrue(self.wait_until(lambda: not dialog._operation_in_progress))
+        dialog.deleteLater()
+        parent.deleteLater()
+        self.app.processEvents()
+
+    def test_edit_dialog_preserves_existing_fifty_minute_time(self):
+        repo = FakeAgendaRepository()
+        parent = QWidget()
+        row = appointment("fifty", "09:00:00")
+        row["end_time"] = "09:50:00"
+        dialog = AppointmentEditDialog(
+            parent,
+            repo,
+            {"id": "profile-1", "role": "admin"},
+            row,
+        )
+        self.assertTrue(self.wait_until(lambda: not dialog._operation_in_progress))
+
+        self.assertEqual(dialog.start_time.time().toString("HH:mm:ss"), "09:00:00")
+        self.assertEqual(dialog.end_time.time().toString("HH:mm:ss"), "09:50:00")
+
         dialog.deleteLater()
         parent.deleteLater()
         self.app.processEvents()

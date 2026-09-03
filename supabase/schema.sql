@@ -51,9 +51,16 @@ create table if not exists public.professionals (
   full_name text not null,
   specialty text not null,
   phone text,
+  agenda_start_time time not null default '08:00:00',
+  agenda_end_time time not null default '18:00:00',
+  agenda_slot_minutes integer not null default 60,
+  agenda_step_minutes integer not null default 60,
   is_active boolean not null default true,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  check (agenda_end_time > agenda_start_time),
+  check (agenda_slot_minutes between 5 and 480),
+  check (agenda_step_minutes between agenda_slot_minutes and 480)
 );
 
 create table if not exists public.recurring_schedules (

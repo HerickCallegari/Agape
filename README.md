@@ -66,11 +66,12 @@ O financeiro considera o valor associado ao atendimento e separa os resultados e
 │   ├── theme.py            # Estilos visuais da aplicação
 │   └── assets/             # Logos, ícones e imagens usadas no app
 ├── supabase/
+│   ├── schema.sql          # Schema consolidado do banco
+│   ├── migrations/         # Migrações incrementais versionadas
+│   ├── manual/             # Scripts pontuais que exigem execução manual
 │   └── functions/
 │       └── reset-user-password/
 │           └── index.ts    # Edge Function para redefinição de senha
-├── supabase_schema.sql     # Schema base do banco
-├── supabase_migration_*.sql# Migrações incrementais
 ├── build_windows.ps1       # Script de build para Windows
 ├── ClinicaAgape.spec       # Configuração do PyInstaller
 ├── main.py                 # Ponto de entrada da aplicação
@@ -111,10 +112,11 @@ python main.py
 
 O projeto usa Supabase Postgres. Para preparar uma base nova:
 
-1. Execute o conteúdo de `supabase_schema.sql` no SQL Editor do Supabase.
-2. Execute as migrações `supabase_migration_*.sql` conforme necessário.
-3. Configure as políticas de RLS para respeitar os perfis do sistema.
-4. Crie os usuários no Supabase Auth e mantenha o vínculo com `public.profiles`.
+1. Execute o conteúdo de `supabase/schema.sql` no SQL Editor do Supabase.
+2. Em bases existentes, execute as migrações de `supabase/migrations/` na ordem necessária.
+3. Use scripts de `supabase/manual/` somente para a correção específica descrita no próprio arquivo.
+4. Configure as políticas de RLS para respeitar os perfis do sistema.
+5. Crie os usuários no Supabase Auth e mantenha o vínculo com `public.profiles`.
 
 ## Edge Function de Senha
 

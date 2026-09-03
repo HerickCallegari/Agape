@@ -57,6 +57,132 @@ from .version import APP_VERSION
 
 STATUSES = ["Agendado", "Confirmado", "Atendido", "Falta com aviso", "Falta sem aviso", "Cancelado"]
 FINANCIAL_ROW_SELECTED_ROLE = Qt.UserRole + 20
+AGENDA_KIND = "_agenda_kind"
+AGENDA_KEY = "_agenda_key"
+
+
+def agenda_time_to_minutes(value: Any, fallback: str) -> int:
+    text = str(value or fallback)[:5]
+    try:
+        hour, minute = (int(part) for part in text.split(":"))
+    except (TypeError, ValueError):
+        hour, minute = (int(part) for part in fallback[:5].split(":"))
+    return hour * 60 + minute
+
+
+def agenda_minutes_to_time(value: int) -> str:
+    return f"{value // 60:02d}:{value % 60:02d}:00"
+
+
+def build_agenda_grid_rows(
+    professionals: list[dict[str, Any]],
+    appointments: list[dict[str, Any]],
+    professional_id: str | None = None,
+    include_free_slots: bool = True,
+) -> list[dict[str, Any]]:
+    """Combina a grade configurada com atendimentos reais sem persistir horários livres."""
+    visible_professionals = [
+        row for row in professionals if professional_id is None or row.get("id") == professional_id
+    ]
+    known_ids = {row.get("id") for row in visible_professionals}
+    for appointment in appointments:
+        appointment_professional_id = appointment.get("professional_id")
+        if (
+            appointment_professional_id not in known_ids
+            and (professional_id is None or appointment_professional_id == professional_id)
+        ):
+            professional = appointment.get("professionals") or {}
+            visible_professionals.append(
+                {
+                    "id": appointment_professional_id,
+                    "full_name": professional.get("full_name", "Profissional não informado"),
+                }
+            )
+            known_ids.add(appointment_professional_id)
+
+    grid_rows: list[dict[str, Any]] = []
+    for professional in visible_professionals:
+        current_professional_id = professional.get("id")
+        start_minutes = agenda_time_to_minutes(
+            professional.get("agenda_start_time"), SupabaseRepository.DEFAULT_AGENDA_START_TIME
+        )
+        end_minutes = agenda_time_to_minutes(
+            professional.get("agenda_end_time"), SupabaseRepository.DEFAULT_AGENDA_END_TIME
+        )
+        try:
+            slot_minutes = int(
+                professional.get("agenda_slot_minutes") or SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES
+            )
+            step_minutes = int(
+                professional.get("agenda_step_minutes")
+                or max(SupabaseRepository.DEFAULT_AGENDA_STEP_MINUTES, slot_minutes)
+            )
+        except (TypeError, ValueError):
+            slot_minutes = SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES
+            step_minutes = SupabaseRepository.DEFAULT_AGENDA_STEP_MINUTES
+        if end_minutes <= start_minutes or slot_minutes < 5 or step_minutes < slot_minutes:
+            start_minutes = agenda_time_to_minutes(
+                SupabaseRepository.DEFAULT_AGENDA_START_TIME, SupabaseRepository.DEFAULT_AGENDA_START_TIME
+            )
+            end_minutes = agenda_time_to_minutes(
+                SupabaseRepository.DEFAULT_AGENDA_END_TIME, SupabaseRepository.DEFAULT_AGENDA_END_TIME
+            )
+            slot_minutes = SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES
+            step_minutes = SupabaseRepository.DEFAULT_AGENDA_STEP_MINUTES
+
+        professional_appointments = [
+            row
+            for row in appointments
+            if row.get("professional_id") == current_professional_id
+        ]
+        slot_start = start_minutes
+        while include_free_slots and slot_start < end_minutes:
+            slot_end = min(slot_start + slot_minutes, end_minutes)
+            has_appointment = any(
+                agenda_time_to_minutes(row.get("start_time"), "00:00:00") < slot_end
+                and agenda_time_to_minutes(row.get("end_time"), "00:00:00") > slot_start
+                for row in professional_appointments
+            )
+            if not has_appointment:
+                slot_start_text = agenda_minutes_to_time(slot_start)
+                slot_end_text = agenda_minutes_to_time(slot_end)
+                row_key = f"{current_professional_id}:free:{slot_start_text}:{slot_end_text}"
+                grid_rows.append(
+                    {
+                        AGENDA_KIND: "free",
+                        AGENDA_KEY: row_key,
+                        "professional_id": current_professional_id,
+                        "professionals": {"full_name": professional.get("full_name", "")},
+                        "start_time": slot_start_text,
+                        "end_time": slot_end_text,
+                        "_agenda_slot_start": slot_start_text,
+                        "_agenda_slot_end": slot_end_text,
+                    }
+                )
+            slot_start += step_minutes
+
+        # Cada atendimento real aparece uma única vez e sempre conserva seus
+        # horários próprios, mesmo quando ocupa mais de uma célula teórica.
+        for appointment in professional_appointments:
+            grid_rows.append(
+                {
+                    **appointment,
+                    AGENDA_KIND: "appointment",
+                    AGENDA_KEY: f"{current_professional_id}:appointment:{appointment.get('id')}",
+                    "_agenda_appointments": [appointment],
+                    "_agenda_slot_start": appointment.get("start_time", ""),
+                    "_agenda_slot_end": appointment.get("end_time", ""),
+                }
+            )
+
+    return sorted(
+        grid_rows,
+        key=lambda row: (
+            row.get("_agenda_slot_start", ""),
+            (row.get("professionals") or {}).get("full_name", "").casefold(),
+            row.get(AGENDA_KEY, ""),
+        ),
+    )
 
 
 class AgendaStatusComboBox(QComboBox):
@@ -451,6 +577,43 @@ def time_field(hour: int, minute: int) -> QTimeEdit:
     return field
 
 
+def agenda_time_field(value: Any, fallback: str) -> QTimeEdit:
+    minutes = agenda_time_to_minutes(value, fallback)
+    return time_field(minutes // 60, minutes % 60)
+
+
+def agenda_duration_field(value: Any = None) -> QComboBox:
+    field = QComboBox()
+    duration_options = [15, 20, 30, 40, 45, 50, 60, 90, 120]
+    try:
+        current_duration = int(value or SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES)
+    except (TypeError, ValueError):
+        current_duration = SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES
+    if current_duration not in duration_options:
+        duration_options.append(current_duration)
+        duration_options.sort()
+    for minutes in duration_options:
+        field.addItem(f"{minutes} minutos", minutes)
+    field.setCurrentIndex(field.findData(current_duration))
+    return field
+
+
+def bind_agenda_duration_fields(duration_field: QComboBox, step_field: QComboBox) -> None:
+    def keep_step_valid(_index: int = -1) -> None:
+        duration = int(duration_field.currentData() or SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES)
+        step = int(step_field.currentData() or SupabaseRepository.DEFAULT_AGENDA_STEP_MINUTES)
+        if step >= duration:
+            return
+        target_index = step_field.findData(duration)
+        if target_index < 0:
+            step_field.addItem(f"{duration} minutos", duration)
+            target_index = step_field.findData(duration)
+        step_field.setCurrentIndex(target_index)
+
+    duration_field.currentIndexChanged.connect(keep_step_valid)
+    keep_step_valid()
+
+
 class LoginWindow(QWidget):
     def __init__(self, repo: SupabaseRepository):
         super().__init__()
@@ -698,6 +861,8 @@ class MainWindow(QMainWindow):
 
     def show_page(self, index: int) -> None:
         page = self.stack.widget(index)
+        if page is self.agenda_page and self.stack.currentWidget() is not self.agenda_page:
+            self.agenda_page.professionals_loaded = False
         self.stack.setCurrentIndex(index)
         self.set_active_nav(index)
         self.safe_refresh_page(page, show_popup=True)
@@ -1577,8 +1742,8 @@ class ProfessionalsPage(QWidget):
         actions.addWidget(self.search)
         actions.addWidget(self.active_only)
         actions.addWidget(self.new_btn)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Nome", "Especialidade", "Telefone", "Status"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Nome", "Especialidade", "Telefone", "Grade diária", "Status"])
         table_polish(self.table)
         self.table.cellDoubleClicked.connect(lambda row, col: self.edit_record(row))
         row_actions = QHBoxLayout()
@@ -1604,7 +1769,17 @@ class ProfessionalsPage(QWidget):
             self.rows = []
         self.table.setRowCount(len(self.rows))
         for row_index, row in enumerate(self.rows):
-            values = [row.get("full_name", ""), row.get("specialty", ""), row.get("phone", ""), "Ativo" if row.get("is_active") else "Inativo"]
+            start_time = str(row.get("agenda_start_time") or SupabaseRepository.DEFAULT_AGENDA_START_TIME)[:5]
+            end_time = str(row.get("agenda_end_time") or SupabaseRepository.DEFAULT_AGENDA_END_TIME)[:5]
+            slot_minutes = row.get("agenda_slot_minutes") or SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES
+            step_minutes = row.get("agenda_step_minutes") or SupabaseRepository.DEFAULT_AGENDA_STEP_MINUTES
+            values = [
+                row.get("full_name", ""),
+                row.get("specialty", ""),
+                row.get("phone", ""),
+                f"{start_time}–{end_time} | {slot_minutes} min, a cada {step_minutes}",
+                "Ativo" if row.get("is_active") else "Inativo",
+            ]
             for col, value in enumerate(values):
                 self.table.setItem(row_index, col, QTableWidgetItem(str(value or "")))
         self.table.resizeColumnsToContents()
@@ -1659,6 +1834,17 @@ class ProfessionalDialog(QDialog):
         if record and record.get("specialty") in SPECIALTIES:
             self.specialty.setCurrentText(record["specialty"])
         self.phone = QLineEdit(record.get("phone", "") if record else "")
+        self.agenda_start = agenda_time_field(
+            record.get("agenda_start_time") if record else None,
+            SupabaseRepository.DEFAULT_AGENDA_START_TIME,
+        )
+        self.agenda_end = agenda_time_field(
+            record.get("agenda_end_time") if record else None,
+            SupabaseRepository.DEFAULT_AGENDA_END_TIME,
+        )
+        self.agenda_slot_minutes = agenda_duration_field(record.get("agenda_slot_minutes") if record else None)
+        self.agenda_step_minutes = agenda_duration_field(record.get("agenda_step_minutes") if record else None)
+        bind_agenda_duration_fields(self.agenda_slot_minutes, self.agenda_step_minutes)
         self.profile = QComboBox()
         try:
             self.profiles = repo.available_professional_profiles(record.get("profile_id") if record else None)
@@ -1682,6 +1868,10 @@ class ProfessionalDialog(QDialog):
         layout.addRow("Nome completo", self.name)
         layout.addRow("Especialidade", self.specialty)
         layout.addRow("Telefone", self.phone)
+        layout.addRow("Grade começa às", self.agenda_start)
+        layout.addRow("Grade termina às", self.agenda_end)
+        layout.addRow("Duração padrão do atendimento", self.agenda_slot_minutes)
+        layout.addRow("Novo horário a cada", self.agenda_step_minutes)
         layout.addRow("Usuário", self.profile)
         layout.addRow("", self.active)
         layout.addRow("", save)
@@ -1699,6 +1889,10 @@ class ProfessionalDialog(QDialog):
             "full_name": self.name.text().strip(),
             "specialty": self.specialty.currentText(),
             "phone": self.phone.text().strip(),
+            "agenda_start_time": self.agenda_start.time().toString("HH:mm:ss"),
+            "agenda_end_time": self.agenda_end.time().toString("HH:mm:ss"),
+            "agenda_slot_minutes": self.agenda_slot_minutes.currentData(),
+            "agenda_step_minutes": self.agenda_step_minutes.currentData(),
             "profile_id": self.profile.currentData(),
             "is_active": self.active.isChecked(),
         }
@@ -1713,6 +1907,7 @@ class AgendaPage(QWidget):
         self.profile = profile
         self.admin_mode_enabled = profile.get("role") == "reception"
         self.rows: list[dict[str, Any]] = []
+        self.agenda_rows: list[dict[str, Any]] = []
         self.professionals: list[dict[str, Any]] = []
         self._refresh_in_progress = False
         self._refresh_pending = False
@@ -1784,7 +1979,7 @@ class AgendaPage(QWidget):
         stats_layout.setVerticalSpacing(8)
         for index, (key, label) in enumerate(
             [
-                ("total", "Total"),
+                ("total", "Com atendimento"),
                 ("confirmed", "Confirmados"),
                 ("completed", "Atendidos"),
                 ("pending", "Pendentes"),
@@ -1915,6 +2110,8 @@ class AgendaPage(QWidget):
         self.list.setEnabled(not write_busy)
 
     def _apply_professionals(self, professionals: list[dict[str, Any]], preferred_id: str | None) -> None:
+        if self.professionals != professionals:
+            self._rendered_agenda_key = None
         self.professional_filter.blockSignals(True)
         self.professional_filter.clear()
         self.professionals = professionals
@@ -2026,16 +2223,26 @@ class AgendaPage(QWidget):
             self.refresh(show_popup=pending_popup)
 
     def _render_rows(self, selected: date) -> None:
-        confirmed = sum(1 for row in self.rows if row.get("status") == "Confirmado")
-        completed = sum(1 for row in self.rows if row.get("status") == "Atendido")
-        pending = sum(1 for row in self.rows if row.get("status") not in {"Atendido", "Cancelado"})
+        visible_appointments = [row for row in self.rows if row.get("status") != "Cancelado"]
+        confirmed = sum(1 for row in visible_appointments if row.get("status") == "Confirmado")
+        completed = sum(1 for row in visible_appointments if row.get("status") == "Atendido")
+        pending = sum(1 for row in visible_appointments if row.get("status") != "Atendido")
         professional_text = self.professional_filter.currentText()
         self.canvas_subtitle.setText(f"{selected.strftime('%d/%m/%Y')} | {professional_text}")
-        self.summary_badge.setText(f"{len(self.rows)} total  |  {confirmed} confirmados  |  {completed} atendidos  |  {pending} pendentes")
-        self.day_stat_labels["total"].setText(str(len(self.rows)))
+        self.summary_badge.setText(
+            f"{len(visible_appointments)} com atendimento  |  {confirmed} confirmados  |  "
+            f"{completed} atendidos  |  {pending} pendentes"
+        )
+        self.day_stat_labels["total"].setText(str(len(visible_appointments)))
         self.day_stat_labels["confirmed"].setText(str(confirmed))
         self.day_stat_labels["completed"].setText(str(completed))
         self.day_stat_labels["pending"].setText(str(pending))
+        self.agenda_rows = build_agenda_grid_rows(
+            self.professionals,
+            self.rows,
+            self.professional_filter.currentData(),
+            include_free_slots=self.professional_filter.currentData() is not None,
+        )
         self.reconcile_appointment_list()
         QTimer.singleShot(0, self._restore_scroll_position)
 
@@ -2047,7 +2254,7 @@ class AgendaPage(QWidget):
         )
 
     def reconcile_appointment_list(self) -> None:
-        if not self.rows:
+        if not self.agenda_rows:
             if self.list.count() == 1 and self.list.item(0).data(Qt.UserRole) is None:
                 return
             self.list.clear()
@@ -2057,8 +2264,8 @@ class AgendaPage(QWidget):
             self.list.setItemWidget(empty, self.empty_agenda_card())
             return
 
-        desired_ids = [row.get("id") for row in self.rows]
-        if any(appointment_id is None for appointment_id in desired_ids) or len(set(desired_ids)) != len(desired_ids):
+        desired_ids = [row.get(AGENDA_KEY) for row in self.agenda_rows]
+        if any(row_id is None for row_id in desired_ids) or len(set(desired_ids)) != len(desired_ids):
             self.rebuild_appointment_list()
             return
 
@@ -2068,7 +2275,7 @@ class AgendaPage(QWidget):
         for index in range(self.list.count()):
             item = self.list.item(index)
             appointment = item.data(Qt.UserRole)
-            appointment_id = appointment.get("id") if isinstance(appointment, dict) else None
+            appointment_id = appointment.get(AGENDA_KEY) if isinstance(appointment, dict) else None
             if appointment_id not in desired_id_set or appointment_id in existing_items:
                 obsolete_rows.append(index)
             else:
@@ -2077,8 +2284,8 @@ class AgendaPage(QWidget):
         for index in reversed(obsolete_rows):
             self.remove_appointment_item(index)
 
-        for target_index, row in enumerate(self.rows):
-            appointment_id = row["id"]
+        for target_index, row in enumerate(self.agenda_rows):
+            appointment_id = row[AGENDA_KEY]
             item = existing_items.get(appointment_id)
             if item is None:
                 item = self.add_appointment_item(row, target_index)
@@ -2092,7 +2299,7 @@ class AgendaPage(QWidget):
         # atendimentos já são inseridos na posição correta acima; se a ordem dos
         # itens existentes mudou, uma reconstrução limpa é mais segura.
         current_ids = [
-            (self.list.item(index).data(Qt.UserRole) or {}).get("id")
+            (self.list.item(index).data(Qt.UserRole) or {}).get(AGENDA_KEY)
             for index in range(self.list.count())
         ]
         if current_ids != desired_ids:
@@ -2100,18 +2307,21 @@ class AgendaPage(QWidget):
 
     def rebuild_appointment_list(self) -> None:
         self.list.clear()
-        for row in self.rows:
+        for row in self.agenda_rows:
             self.add_appointment_item(row)
 
     def add_appointment_item(self, row: dict[str, Any], index: int | None = None) -> QListWidgetItem:
         item = QListWidgetItem()
         item.setData(Qt.UserRole, row)
-        item.setSizeHint(QSize(10, 96))
+        item.setSizeHint(QSize(10, 96 if row.get(AGENDA_KIND) == "appointment" else 78))
         if index is None:
             self.list.addItem(item)
         else:
             self.list.insertItem(index, item)
-        self.list.setItemWidget(item, self.appointment_card(row))
+        self.list.setItemWidget(
+            item,
+            self.appointment_card(row) if row.get(AGENDA_KIND) == "appointment" else self.free_slot_card(row),
+        )
         return item
 
     def update_appointment_item(self, item: QListWidgetItem, row: dict[str, Any]) -> None:
@@ -2120,8 +2330,11 @@ class AgendaPage(QWidget):
         if old_widget is not None:
             old_widget.deleteLater()
         item.setData(Qt.UserRole, row)
-        item.setSizeHint(QSize(10, 96))
-        self.list.setItemWidget(item, self.appointment_card(row))
+        item.setSizeHint(QSize(10, 96 if row.get(AGENDA_KIND) == "appointment" else 78))
+        self.list.setItemWidget(
+            item,
+            self.appointment_card(row) if row.get(AGENDA_KIND) == "appointment" else self.free_slot_card(row),
+        )
 
     def remove_appointment_item(self, index: int) -> None:
         item = self.list.item(index)
@@ -2136,17 +2349,51 @@ class AgendaPage(QWidget):
         style_card(frame, COLORS["surface_warm"], COLORS["line"])
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(18, 18, 18, 18)
-        title = QLabel("Nenhum atendimento nesta data")
+        title = QLabel("Nenhuma grade disponível")
         title.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-size: 17px; font-weight: 800;")
-        subtitle = QLabel("Use os filtros acima ou crie um novo atendimento.")
+        subtitle = QLabel("Não há profissional disponível para esta visualização.")
         subtitle.setObjectName("Muted")
         subtitle.setStyleSheet("background: transparent;")
         layout.addWidget(title)
         layout.addWidget(subtitle)
         return frame
 
+    def free_slot_card(self, row: dict[str, Any]) -> QWidget:
+        professional = (row.get("professionals") or {}).get("full_name", "")
+        frame = QFrame()
+        style_card(frame, "#F4FBF7", "#BBDCC8")
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(16, 11, 16, 11)
+        layout.setSpacing(16)
+
+        time_label = QLabel(f"{row['start_time'][:5]}\n{row['end_time'][:5]}")
+        time_label.setMinimumWidth(66)
+        time_label.setAlignment(Qt.AlignCenter)
+        time_label.setStyleSheet(
+            "background: #E3F5EA; color: #23623C; border: 1px solid #BBDCC8; "
+            "border-radius: 8px; padding: 6px; font-size: 16px; font-weight: 800;"
+        )
+        details = QVBoxLayout()
+        free_label = QLabel("Livre")
+        free_label.setStyleSheet("background: transparent; color: #23623C; font-size: 16px; font-weight: 800;")
+        professional_label = QLabel(professional or "Profissional não informado")
+        professional_label.setStyleSheet(f"background: transparent; color: {COLORS['muted']};")
+        details.addWidget(free_label)
+        details.addWidget(professional_label)
+        schedule = button("Agendar", secondary=True)
+        schedule.setCursor(Qt.PointingHandCursor)
+        schedule.clicked.connect(lambda _checked=False, slot=row: self.create_appointment(slot))
+        schedule.setEnabled(self._allowed_to_manage and not self._write_in_progress)
+        layout.addWidget(time_label)
+        layout.addLayout(details, 1)
+        layout.addWidget(schedule)
+        return frame
+
     def appointment_card(self, row: dict[str, Any]) -> QWidget:
+        appointments = row.get("_agenda_appointments") or [row]
         patient = (row.get("patients") or {}).get("full_name", "")
+        if len(appointments) > 1:
+            patient = f"{len(appointments)} atendimentos neste horário"
         professional = (row.get("professionals") or {}).get("full_name", "")
         bg, fg = STATUS_COLORS.get(row["status"], ("#FFFFFF", COLORS["text"]))
         frame = QFrame()
@@ -2160,7 +2407,9 @@ class AgendaPage(QWidget):
         marker.setFixedWidth(5)
         marker.setStyleSheet(f"background: {border_color}; border-radius: 2px;")
 
-        time_label = QLabel(f"{row['start_time'][:5]}\n{row['end_time'][:5]}")
+        appointment_start = row.get("start_time", "")
+        appointment_end = row.get("end_time", "")
+        time_label = QLabel(f"{appointment_start[:5]}\n{appointment_end[:5]}")
         time_label.setMinimumWidth(66)
         time_label.setAlignment(Qt.AlignCenter)
         time_label.setStyleSheet(
@@ -2168,7 +2417,7 @@ class AgendaPage(QWidget):
             "border-radius: 8px; padding: 8px; font-size: 18px; font-weight: 800;"
         )
         details = QVBoxLayout()
-        patient_label = QLabel(patient or "Paciente não informado")
+        patient_label = QLabel(f"Com atendimento — {patient or 'Paciente não informado'}")
         patient_label.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-size: 16px; font-weight: 800;")
         professional_label = QLabel(professional or "Profissional não informado")
         professional_label.setStyleSheet(f"background: transparent; color: {COLORS['muted']};")
@@ -2247,8 +2496,11 @@ class AgendaPage(QWidget):
             previous_status = context["previous_status"]
             if error is None:
                 appointment["status"] = status
-                self.update_day_summary()
-                self.apply_status_style(combo, status)
+                for source_row in self.rows:
+                    if source_row.get("id") == appointment.get("id"):
+                        source_row["status"] = status
+                        break
+                self._render_rows(self.date_edit.date().toPython())
                 LOGGER.info("Alteração de status concluída")
                 self.activity_completed.emit()
             else:
@@ -2298,14 +2550,15 @@ class AgendaPage(QWidget):
         )
 
     def update_day_summary(self) -> None:
-        confirmed = sum(1 for row in self.rows if row.get("status") == "Confirmado")
-        completed = sum(1 for row in self.rows if row.get("status") == "Atendido")
-        pending = sum(1 for row in self.rows if row.get("status") not in {"Atendido", "Cancelado"})
+        visible_appointments = [row for row in self.rows if row.get("status") != "Cancelado"]
+        confirmed = sum(1 for row in visible_appointments if row.get("status") == "Confirmado")
+        completed = sum(1 for row in visible_appointments if row.get("status") == "Atendido")
+        pending = sum(1 for row in visible_appointments if row.get("status") != "Atendido")
         self.summary_badge.setText(
-            f"{len(self.rows)} total  |  {confirmed} confirmados  |  "
+            f"{len(visible_appointments)} com atendimento  |  {confirmed} confirmados  |  "
             f"{completed} atendidos  |  {pending} pendentes"
         )
-        self.day_stat_labels["total"].setText(str(len(self.rows)))
+        self.day_stat_labels["total"].setText(str(len(visible_appointments)))
         self.day_stat_labels["confirmed"].setText(str(confirmed))
         self.day_stat_labels["completed"].setText(str(completed))
         self.day_stat_labels["pending"].setText(str(pending))
@@ -2318,16 +2571,29 @@ class AgendaPage(QWidget):
         row = self.selected_row()
         if not row:
             return
+        if row.get(AGENDA_KIND) == "free":
+            self.create_appointment(row)
+            return
+        appointments = row.get("_agenda_appointments") or [row]
+        row = appointments[0]
         dialog = AppointmentDetailsDialog(self, self.repo, self.profile, row)
         if dialog.exec():
             self.refresh()
 
-    def create_appointment(self) -> None:
+    def create_appointment(self, slot: dict[str, Any] | None = None) -> None:
         if self.is_busy:
             return
+        if not isinstance(slot, dict):
+            slot = None
         self._write_in_progress = True
         self._set_busy_ui("Carregando formulário...")
-        self._write_context = {"kind": "prepare_create", "selected_date": self.date_edit.date().toPython()}
+        self._write_context = {
+            "kind": "prepare_create",
+            "selected_date": self.date_edit.date().toPython(),
+            "professional_id": slot.get("professional_id") if slot else self.professional_filter.currentData(),
+            "start_time": slot.get("start_time") if slot else None,
+            "end_time": slot.get("end_time") if slot else None,
+        }
         self._write_task_id = start_worker(
             self,
             self._on_create_form_loaded,
@@ -2343,6 +2609,9 @@ class AgendaPage(QWidget):
         if task_id != self._write_task_id:
             return
         selected_date = self._write_context.get("selected_date", self.date_edit.date().toPython())
+        professional_id = self._write_context.get("professional_id")
+        start_time = self._write_context.get("start_time")
+        end_time = self._write_context.get("end_time")
         self._write_task_id = None
         self._write_in_progress = False
         self._write_context = {}
@@ -2356,6 +2625,9 @@ class AgendaPage(QWidget):
             selected_date,
             patients=result["patients"],
             professionals=result["professionals"],
+            selected_professional_id=professional_id,
+            selected_start_time=start_time,
+            selected_end_time=end_time,
         )
         if not dialog.exec():
             return
@@ -2373,6 +2645,10 @@ class AgendaPage(QWidget):
             return
         self._write_in_progress = True
         self._set_busy_ui("Carregando formulário...")
+        self._write_context = {
+            "kind": "prepare_recurring",
+            "professional_id": self.professional_filter.currentData(),
+        }
         self._write_task_id = start_worker(
             self,
             self._on_recurring_form_loaded,
@@ -2387,8 +2663,10 @@ class AgendaPage(QWidget):
         forget_worker(self, task_id)
         if task_id != self._write_task_id:
             return
+        professional_id = self._write_context.get("professional_id")
         self._write_task_id = None
         self._write_in_progress = False
+        self._write_context = {}
         self._set_busy_ui("")
         if error is not None:
             show_error(self, error)
@@ -2398,6 +2676,7 @@ class AgendaPage(QWidget):
             self.repo,
             patients=result["patients"],
             professionals=result["professionals"],
+            selected_professional_id=professional_id,
         )
         if not dialog.exec():
             return
@@ -2428,6 +2707,9 @@ class AppointmentDialog(QDialog):
         *,
         patients: list[dict[str, Any]] | None = None,
         professionals: list[dict[str, Any]] | None = None,
+        selected_professional_id: str | None = None,
+        selected_start_time: str | None = None,
+        selected_end_time: str | None = None,
     ):
         super().__init__(parent)
         self.repo = repo
@@ -2441,10 +2723,23 @@ class AppointmentDialog(QDialog):
         self.professional = QComboBox()
         for item in self.professionals:
             self.professional.addItem(item["full_name"], item["id"])
+        if selected_professional_id:
+            selected_index = self.professional.findData(selected_professional_id)
+            if selected_index >= 0:
+                self.professional.setCurrentIndex(selected_index)
         self.date_edit = QDateEdit(QDate(selected_date.year, selected_date.month, selected_date.day))
         self.date_edit.setCalendarPopup(True)
-        self.start = time_field(8, 0)
+        professional = self.current_professional()
+        default_start = selected_start_time or (professional or {}).get("agenda_start_time")
+        self.start = agenda_time_field(default_start, SupabaseRepository.DEFAULT_AGENDA_START_TIME)
         self.end = time_field(9, 0)
+        selected_end = QTime.fromString((selected_end_time or "")[:5], "HH:mm")
+        if selected_end.isValid():
+            self.end.setTime(selected_end)
+        else:
+            self.sync_end_from_duration()
+        self.professional.currentIndexChanged.connect(self.apply_professional_defaults)
+        self.start.timeChanged.connect(self.sync_end_from_duration)
         self.status = QComboBox()
         self.status.addItems(STATUSES)
         self.consultation_fee = QLineEdit()
@@ -2459,6 +2754,29 @@ class AppointmentDialog(QDialog):
         layout.addRow("Status", self.status)
         layout.addRow("Valor da sessão", self.consultation_fee)
         layout.addRow("", save)
+
+    def current_professional(self) -> dict[str, Any] | None:
+        professional_id = self.professional.currentData()
+        return next((row for row in self.professionals if row.get("id") == professional_id), None)
+
+    def professional_duration(self) -> int:
+        professional = self.current_professional() or {}
+        try:
+            return int(professional.get("agenda_slot_minutes") or SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES)
+        except (TypeError, ValueError):
+            return SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES
+
+    def sync_end_from_duration(self, _value: Any = None) -> None:
+        self.end.setTime(self.start.time().addSecs(self.professional_duration() * 60))
+
+    def apply_professional_defaults(self, _index: int = -1) -> None:
+        professional = self.current_professional() or {}
+        start_minutes = agenda_time_to_minutes(
+            professional.get("agenda_start_time"),
+            SupabaseRepository.DEFAULT_AGENDA_START_TIME,
+        )
+        self.start.setTime(QTime(start_minutes // 60, start_minutes % 60))
+        self.sync_end_from_duration()
 
     def values(self) -> dict[str, Any]:
         return {
@@ -2480,6 +2798,7 @@ class RecurringDialog(QDialog):
         *,
         patients: list[dict[str, Any]] | None = None,
         professionals: list[dict[str, Any]] | None = None,
+        selected_professional_id: str | None = None,
     ):
         super().__init__(parent)
         self.repo = repo
@@ -2493,11 +2812,22 @@ class RecurringDialog(QDialog):
         self.professional = QComboBox()
         for item in self.professionals:
             self.professional.addItem(item["full_name"], item["id"])
+        if selected_professional_id:
+            selected_index = self.professional.findData(selected_professional_id)
+            if selected_index >= 0:
+                self.professional.setCurrentIndex(selected_index)
         self.weekday = QComboBox()
         for idx, label in enumerate(["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]):
             self.weekday.addItem(label, idx)
-        self.start = time_field(8, 0)
+        professional = self.current_professional()
+        self.start = agenda_time_field(
+            (professional or {}).get("agenda_start_time"),
+            SupabaseRepository.DEFAULT_AGENDA_START_TIME,
+        )
         self.end = time_field(9, 0)
+        self.sync_end_from_duration()
+        self.professional.currentIndexChanged.connect(self.apply_professional_defaults)
+        self.start.timeChanged.connect(self.sync_end_from_duration)
         today = QDate.currentDate()
         self.start_date = QDateEdit(today)
         self.start_date.setCalendarPopup(True)
@@ -2516,6 +2846,29 @@ class RecurringDialog(QDialog):
         layout.addRow("Data inicial", self.start_date)
         layout.addRow("Data final", self.end_date)
         layout.addRow("", save)
+
+    def current_professional(self) -> dict[str, Any] | None:
+        professional_id = self.professional.currentData()
+        return next((row for row in self.professionals if row.get("id") == professional_id), None)
+
+    def professional_duration(self) -> int:
+        professional = self.current_professional() or {}
+        try:
+            return int(professional.get("agenda_slot_minutes") or SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES)
+        except (TypeError, ValueError):
+            return SupabaseRepository.DEFAULT_AGENDA_SLOT_MINUTES
+
+    def sync_end_from_duration(self, _value: Any = None) -> None:
+        self.end.setTime(self.start.time().addSecs(self.professional_duration() * 60))
+
+    def apply_professional_defaults(self, _index: int = -1) -> None:
+        professional = self.current_professional() or {}
+        start_minutes = agenda_time_to_minutes(
+            professional.get("agenda_start_time"),
+            SupabaseRepository.DEFAULT_AGENDA_START_TIME,
+        )
+        self.start.setTime(QTime(start_minutes // 60, start_minutes % 60))
+        self.sync_end_from_duration()
 
     def values(self) -> dict[str, Any]:
         return {
@@ -4372,13 +4725,21 @@ class FinancePage(QWidget):
 
     def group_by_patient(self) -> list[dict[str, Any]]:
         selected_patient_id = self.patient_filter.currentData()
+        selected_professional_id = self.professional_filter.currentData()
+        professional_patient_ids = {
+            row.get("patient_id")
+            for row in self.appointment_rows
+            if row.get("patient_id")
+        } if selected_professional_id else None
         grouped: dict[str, dict[str, Any]] = {
             patient["id"]: {
                 "id": patient["id"], "name": patient.get("full_name", "Paciente não informado"),
                 "count": 0, "total": 0.0, "received": 0.0, "open": 0.0,
             }
             for patient in self.patients
-            if patient.get("id") and (not selected_patient_id or patient.get("id") == selected_patient_id)
+            if patient.get("id")
+            and (not selected_patient_id or patient.get("id") == selected_patient_id)
+            and (professional_patient_ids is None or patient.get("id") in professional_patient_ids)
         }
         payments = self.payment_totals_by_payment_date()
         for row in self.appointment_rows:
@@ -4405,6 +4766,12 @@ class FinancePage(QWidget):
 
     def group_by_professional(self) -> list[dict[str, Any]]:
         selected_professional_id = self.professional_filter.currentData()
+        selected_patient_id = self.patient_filter.currentData()
+        patient_professional_ids = {
+            row.get("professional_id")
+            for row in self.appointment_rows
+            if row.get("professional_id")
+        } if selected_patient_id else None
         grouped: dict[str, dict[str, Any]] = {
             professional["id"]: {
                 "id": professional["id"], "name": professional.get("full_name", "Funcionário não informado"),
@@ -4415,6 +4782,7 @@ class FinancePage(QWidget):
             if professional.get("id") and (
                 not selected_professional_id or professional.get("id") == selected_professional_id
             )
+            and (patient_professional_ids is None or professional.get("id") in patient_professional_ids)
         }
         repassed_by_professional: dict[str, float] = {}
         for operation in self.receipt_history_rows:
@@ -6415,6 +6783,11 @@ class NewUserDialog(QDialog):
         self.can_attend = QCheckBox("Pode realizar atendimentos")
         self.specialty = QComboBox()
         self.specialty.addItems(SPECIALTIES)
+        self.agenda_start = agenda_time_field(None, SupabaseRepository.DEFAULT_AGENDA_START_TIME)
+        self.agenda_end = agenda_time_field(None, SupabaseRepository.DEFAULT_AGENDA_END_TIME)
+        self.agenda_slot_minutes = agenda_duration_field()
+        self.agenda_step_minutes = agenda_duration_field(SupabaseRepository.DEFAULT_AGENDA_STEP_MINUTES)
+        bind_agenda_duration_fields(self.agenda_slot_minutes, self.agenda_step_minutes)
         self.can_attend.stateChanged.connect(self.sync_attendance_fields)
         self.role.currentIndexChanged.connect(self.sync_role_defaults)
         save = button("Criar usuário")
@@ -6447,9 +6820,13 @@ class NewUserDialog(QDialog):
         self.history_table.setHorizontalHeaderLabels(["Data", "Horário", "Paciente", "Status"])
         table_polish(self.history_table)
         self.fill_history([])
-        attendance_layout.addWidget(QLabel("Histórico de atendimentos"), 0, 0)
-        attendance_layout.addWidget(self.history_table, 1, 0, 1, 2)
-        attendance_layout.setRowStretch(1, 1)
+        self.add_field(attendance_layout, "Grade começa às", self.agenda_start, 0, 0)
+        self.add_field(attendance_layout, "Grade termina às", self.agenda_end, 0, 1)
+        self.add_field(attendance_layout, "Duração padrão do atendimento", self.agenda_slot_minutes, 1, 0)
+        self.add_field(attendance_layout, "Novo horário a cada", self.agenda_step_minutes, 1, 1)
+        attendance_layout.addWidget(QLabel("Histórico de atendimentos"), 2, 0)
+        attendance_layout.addWidget(self.history_table, 3, 0, 1, 2)
+        attendance_layout.setRowStretch(3, 1)
 
         tabs.addTab(personal_tab, "Dados pessoais")
         tabs.addTab(address_tab, "Endereço")
@@ -6483,6 +6860,10 @@ class NewUserDialog(QDialog):
     def sync_attendance_fields(self) -> None:
         enabled = self.can_attend.isChecked()
         self.specialty.setEnabled(enabled)
+        self.agenda_start.setEnabled(enabled)
+        self.agenda_end.setEnabled(enabled)
+        self.agenda_slot_minutes.setEnabled(enabled)
+        self.agenda_step_minutes.setEnabled(enabled)
         self.can_attend.setCursor(Qt.PointingHandCursor)
         self.can_attend.setStyleSheet(
             f"""
@@ -6524,6 +6905,10 @@ class NewUserDialog(QDialog):
             "state": self.state.text().strip().upper(),
             "can_attend": self.can_attend.isChecked(),
             "specialty": self.specialty.currentText() if self.can_attend.isChecked() else "",
+            "agenda_start_time": self.agenda_start.time().toString("HH:mm:ss"),
+            "agenda_end_time": self.agenda_end.time().toString("HH:mm:ss"),
+            "agenda_slot_minutes": self.agenda_slot_minutes.currentData(),
+            "agenda_step_minutes": self.agenda_step_minutes.currentData(),
         }
 
 
@@ -6532,6 +6917,10 @@ class ProfilePermissionsDialog(QDialog):
         super().__init__(parent)
         self.repo = repo
         self.profile = profile
+        try:
+            self.professional = repo.professional_for_profile(profile["id"]) or {}
+        except Exception:
+            self.professional = {}
         self.setWindowTitle("Funcionário do sistema")
         self.setMinimumSize(860, 520)
         root = QVBoxLayout(self)
@@ -6591,6 +6980,17 @@ class ProfilePermissionsDialog(QDialog):
         self.specialty.addItems(SPECIALTIES)
         if profile.get("specialty") in SPECIALTIES:
             self.specialty.setCurrentText(profile["specialty"])
+        self.agenda_start = agenda_time_field(
+            self.professional.get("agenda_start_time"),
+            SupabaseRepository.DEFAULT_AGENDA_START_TIME,
+        )
+        self.agenda_end = agenda_time_field(
+            self.professional.get("agenda_end_time"),
+            SupabaseRepository.DEFAULT_AGENDA_END_TIME,
+        )
+        self.agenda_slot_minutes = agenda_duration_field(self.professional.get("agenda_slot_minutes"))
+        self.agenda_step_minutes = agenda_duration_field(self.professional.get("agenda_step_minutes"))
+        bind_agenda_duration_fields(self.agenda_slot_minutes, self.agenda_step_minutes)
         self.can_attend.stateChanged.connect(self.sync_attendance_fields)
         save = button("Salvar funcionário")
         save.clicked.connect(self.accept)
@@ -6619,9 +7019,13 @@ class ProfilePermissionsDialog(QDialog):
         self.history_table.setHorizontalHeaderLabels(["Data", "Horário", "Paciente", "Status"])
         table_polish(self.history_table)
         self.fill_history()
-        attendance_layout.addWidget(QLabel("Histórico de atendimentos"), 0, 0)
-        attendance_layout.addWidget(self.history_table, 1, 0, 1, 2)
-        attendance_layout.setRowStretch(1, 1)
+        self.add_field(attendance_layout, "Grade começa às", self.agenda_start, 0, 0)
+        self.add_field(attendance_layout, "Grade termina às", self.agenda_end, 0, 1)
+        self.add_field(attendance_layout, "Duração padrão do atendimento", self.agenda_slot_minutes, 1, 0)
+        self.add_field(attendance_layout, "Novo horário a cada", self.agenda_step_minutes, 1, 1)
+        attendance_layout.addWidget(QLabel("Histórico de atendimentos"), 2, 0)
+        attendance_layout.addWidget(self.history_table, 3, 0, 1, 2)
+        attendance_layout.setRowStretch(3, 1)
 
         tabs.addTab(personal_tab, "Dados pessoais")
         tabs.addTab(address_tab, "Endereço")
@@ -6696,6 +7100,10 @@ class ProfilePermissionsDialog(QDialog):
     def sync_attendance_fields(self) -> None:
         enabled = self.can_attend.isChecked()
         self.specialty.setEnabled(enabled)
+        self.agenda_start.setEnabled(enabled)
+        self.agenda_end.setEnabled(enabled)
+        self.agenda_slot_minutes.setEnabled(enabled)
+        self.agenda_step_minutes.setEnabled(enabled)
         self.can_attend.setCursor(Qt.PointingHandCursor)
         self.can_attend.setStyleSheet(
             f"""
@@ -6736,6 +7144,10 @@ class ProfilePermissionsDialog(QDialog):
             "state": self.state.text().strip().upper(),
             "can_attend": self.can_attend.isChecked(),
             "specialty": self.specialty.currentText() if self.can_attend.isChecked() else "",
+            "agenda_start_time": self.agenda_start.time().toString("HH:mm:ss"),
+            "agenda_end_time": self.agenda_end.time().toString("HH:mm:ss"),
+            "agenda_slot_minutes": self.agenda_slot_minutes.currentData(),
+            "agenda_step_minutes": self.agenda_step_minutes.currentData(),
         }
 
 

@@ -147,6 +147,94 @@ class ProfessionalReadTests(unittest.TestCase):
         self.assertEqual(repo.client.updates, [])
 
 
+class ProfessionalAgendaConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = object.__new__(SupabaseRepository)
+
+    def test_reversed_grid_time_is_rejected_before_writing(self):
+        with self.assertRaisesRegex(AppError, "horário final da grade"):
+            self.repo.save_professional({
+                "full_name": "Profissional",
+                "profile_id": "profile-1",
+                "agenda_start_time": "18:00:00",
+                "agenda_end_time": "08:00:00",
+                "agenda_slot_minutes": 60,
+            })
+
+    def test_start_interval_cannot_be_shorter_than_appointment_duration(self):
+        with self.assertRaisesRegex(AppError, "intervalo entre novos horários"):
+            self.repo.professional_agenda_values({
+                "agenda_start_time": "08:00:00",
+                "agenda_end_time": "18:00:00",
+                "agenda_slot_minutes": 50,
+                "agenda_step_minutes": 40,
+            })
+
+    def test_grid_migration_is_additive_and_does_not_touch_appointments(self):
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "supabase"
+            / "migrations"
+            / "supabase_migration_20260903_professional_agenda_grid.sql"
+        ).read_text(encoding="utf-8").lower()
+
+        self.assertIn("add column if not exists agenda_start_time", migration)
+        self.assertIn("add column if not exists agenda_end_time", migration)
+        self.assertIn("add column if not exists agenda_slot_minutes", migration)
+        self.assertIn("add column if not exists agenda_step_minutes", migration)
+        self.assertIn("ranked_durations", migration)
+        self.assertIn("ranked_steps", migration)
+        self.assertNotIn("delete from", migration)
+        self.assertNotIn("update public.appointments", migration)
+        self.assertNotIn("alter table public.appointments", migration)
+        self.assertNotIn("status <> 'cancelado'", migration)
+
+
+class AppointmentConflictTests(unittest.TestCase):
+    class Query:
+        def __init__(self, rows):
+            self.rows = list(rows)
+
+        def select(self, *_args): return self
+        def eq(self, field, value):
+            self.rows = [row for row in self.rows if row.get(field) == value]
+            return self
+        def neq(self, field, value):
+            self.rows = [row for row in self.rows if row.get(field) != value]
+            return self
+        def lt(self, field, value):
+            self.rows = [row for row in self.rows if row.get(field) < value]
+            return self
+        def gt(self, field, value):
+            self.rows = [row for row in self.rows if row.get(field) > value]
+            return self
+        def execute(self):
+            return type("Result", (), {"data": self.rows})()
+
+    class Client:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def table(self, _name):
+            return AppointmentConflictTests.Query(self.rows)
+
+    def test_cancelled_appointment_still_blocks_same_time(self):
+        repo = object.__new__(SupabaseRepository)
+        repo.client = self.Client([{
+            "id": "cancelled-1",
+            "professional_id": "professional-1",
+            "appointment_date": "2026-09-03",
+            "start_time": "09:00:00",
+            "end_time": "09:50:00",
+            "status": "Cancelado",
+        }])
+
+        with self.assertRaisesRegex(AppError, "já possui um atendimento"):
+            repo.assert_no_conflict(
+                "professional-1", "2026-09-03", "09:00:00", "09:50:00"
+            )
+
+
 class ProfessionalProfileLinkTests(unittest.TestCase):
     class Query:
         def __init__(self, client):
@@ -284,7 +372,9 @@ class ProfessionalAppointmentVisibilityTests(unittest.TestCase):
     def test_migration_repairs_profile_link_and_enforces_unique_profile(self):
         migration = (
             Path(__file__).resolve().parents[1]
-            / "supabase_migration_20260903_professional_profile_repair.sql"
+            / "supabase"
+            / "manual"
+            / "professional_profile_repair.sql"
         ).read_text(encoding="utf-8")
         self.assertIn("v_history_professional_id", migration)
         self.assertIn("v_empty_professional_id", migration)
@@ -476,6 +566,8 @@ class AtomicFinancialTransactionTests(unittest.TestCase):
     def test_new_payment_items_are_inserted_without_individual_amount(self):
         migration = (
             Path(__file__).resolve().parents[1]
+            / "supabase"
+            / "migrations"
             / "supabase_migration_20260806_financial_item_status_flags.sql"
         ).read_text(encoding="utf-8")
         self.assertIn(
