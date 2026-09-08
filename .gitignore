@@ -70,3 +70,6 @@ release/
 # PDFs locais, se não forem necessários
 *.pdf
 3ARCHITECTURE_CONTEXT.md.md
+
+.agents/
+skills-lock.json
