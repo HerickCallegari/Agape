@@ -629,6 +629,7 @@ class LoginWindow(QWidget):
 
         logo = QLabel()
         logo.setAlignment(Qt.AlignCenter)
+        logo.setFixedHeight(150)
         logo.setStyleSheet("background: transparent;")
         logo_path = resource_path("clinica_agape_logo.jpeg")
         pixmap = QPixmap(str(logo_path))
@@ -641,15 +642,35 @@ class LoginWindow(QWidget):
         self.email = QLineEdit()
         self.email.setPlaceholderText("E-mail")
         self.email.setMinimumHeight(44)
+        self.email.setAccessibleName("E-mail")
         self.password = QLineEdit()
         self.password.setPlaceholderText("Senha")
         self.password.setEchoMode(QLineEdit.Password)
         self.password.setMinimumHeight(44)
+        self.password.setAccessibleName("Senha")
+        email_label = QLabel("E-mail")
+        email_label.setBuddy(self.email)
+        email_label.setStyleSheet("background: transparent; font-weight: 700;")
+        password_label = QLabel("Senha")
+        password_label.setBuddy(self.password)
+        password_label.setStyleSheet("background: transparent; font-weight: 700;")
+        self.show_password = QCheckBox("Mostrar senha")
+        self.show_password.setAccessibleName("Mostrar senha")
+        self.show_password.setCursor(Qt.PointingHandCursor)
+        self.show_password.setStyleSheet(
+            "QCheckBox { background: transparent; border: none; padding: 0; spacing: 8px; }"
+        )
+        self.show_password.toggled.connect(
+            lambda checked: self.password.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+        )
         self.error = QLabel("")
         self.error.setMinimumHeight(22)
         self.error.setStyleSheet(f"background: transparent; color: {COLORS['red']};")
+        self.error.setAccessibleName("Mensagem de erro de autenticação")
+        self.error.setWordWrap(True)
         self.login_button = button("Entrar")
         self.login_button.setMinimumHeight(44)
+        self.login_button.setAccessibleName("Entrar")
         self.login_button.clicked.connect(self.handle_login)
         self.password.returnPressed.connect(self.handle_login)
 
@@ -660,8 +681,11 @@ class LoginWindow(QWidget):
         panel_layout.setSpacing(15)
         panel_layout.addWidget(logo)
         panel_layout.addSpacing(10)
+        panel_layout.addWidget(email_label)
         panel_layout.addWidget(self.email)
+        panel_layout.addWidget(password_label)
         panel_layout.addWidget(self.password)
+        panel_layout.addWidget(self.show_password)
         panel_layout.addWidget(self.error)
         panel_layout.addWidget(self.login_button)
 
@@ -677,6 +701,8 @@ class LoginWindow(QWidget):
     def handle_login(self) -> None:
         self.error.clear()
         self.login_button.setEnabled(False)
+        self.login_button.setText("Entrando...")
+        QApplication.processEvents()
         try:
             profile = self.repo.login(self.email.text().strip(), self.password.text())
             self.main_window = MainWindow(self.repo, profile)
@@ -685,7 +711,12 @@ class LoginWindow(QWidget):
             self.close()
         except Exception as exc:
             self.error.setText(str(exc))
+            if not self.email.text().strip():
+                self.email.setFocus()
+            else:
+                self.password.setFocus()
         finally:
+            self.login_button.setText("Entrar")
             self.login_button.setEnabled(True)
 
 
@@ -749,7 +780,7 @@ class MainWindow(QMainWindow):
         role_label = QLabel(str(profile_role))
         role_label.setStyleSheet(
             "background: rgba(255, 255, 255, 0.16); border: none; border-radius: 6px; "
-            "color: #FFFFFF; padding: 3px 7px; font-size: 11px; font-weight: 700;"
+            "color: #FFFFFF; padding: 3px 7px; font-size: 13px; font-weight: 700;"
         )
         profile_text.addWidget(name_label)
         profile_text.addWidget(role_label, 0, Qt.AlignLeft)
@@ -778,6 +809,7 @@ class MainWindow(QMainWindow):
         for index, (label, page) in enumerate(self.pages):
             self.stack.addWidget(page)
             nav = QPushButton(label)
+            nav.setAccessibleName(f"Abrir {label}")
             nav.clicked.connect(lambda checked=False, i=index: self.show_page(i))
             self.nav_buttons.append(nav)
             side_layout.addWidget(nav)
@@ -1043,7 +1075,7 @@ class DashboardPage(QWidget):
         title.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-weight: 800;")
         subtitle = QLabel("Abra a agenda para criar ou consultar outros dias.")
         subtitle.setObjectName("Muted")
-        subtitle.setStyleSheet("background: transparent; font-size: 12px;")
+        subtitle.setStyleSheet("background: transparent; font-size: 13px;")
         layout.addWidget(title)
         layout.addWidget(subtitle)
         return frame
@@ -1119,9 +1151,11 @@ class PatientsPage(QWidget):
         self.card_title.setStyleSheet(f"background: transparent; color: {COLORS['text']}; font-size: 17px; font-weight: 800;")
         self.search = QLineEdit()
         self.search.setPlaceholderText("Buscar paciente...")
+        self.search.setAccessibleName("Buscar paciente")
         self.search.textChanged.connect(self.refresh)
         self.search.setFixedWidth(360)
         self.active_only = QCheckBox("Somente ativos")
+        self.active_only.setAccessibleName("Mostrar somente pacientes ativos")
         self.active_only.setChecked(True)
         self.active_only.setCursor(Qt.PointingHandCursor)
         self.active_only.setMinimumHeight(44)
@@ -1156,23 +1190,34 @@ class PatientsPage(QWidget):
         self.active_only.stateChanged.connect(self.refresh)
         can_manage_patients = can(self.profile, Permission.MANAGE_PATIENTS)
         self.new_btn = button("Novo paciente")
+        self.new_btn.setAccessibleName("Cadastrar novo paciente")
         self.new_btn.clicked.connect(self.create_record)
         self.new_btn.setVisible(can_manage_patients)
+        self.edit_btn = button("Editar paciente", secondary=True)
+        self.edit_btn.setAccessibleName("Editar paciente selecionado")
+        self.edit_btn.clicked.connect(lambda: self.edit_record(self.table.currentRow()))
+        self.edit_btn.setVisible(can_manage_patients)
+        self.edit_btn.setEnabled(False)
         self.delete_btn = button("Excluir paciente", danger=True)
+        self.delete_btn.setAccessibleName("Excluir paciente selecionado")
         self.delete_btn.clicked.connect(self.delete_record)
         self.delete_btn.setVisible(can_manage_patients)
+        self.delete_btn.setEnabled(False)
         card_header.addWidget(self.card_title)
         card_header.addStretch()
         card_header.addWidget(self.search)
         card_header.addWidget(self.active_only)
+        card_header.addWidget(self.edit_btn)
         card_header.addWidget(self.delete_btn)
         card_header.addWidget(self.new_btn)
         self.table = QTableWidget(0, 6)
+        self.table.setAccessibleName("Lista de pacientes")
         self.table.setHorizontalHeaderLabels(["Nome", "Documento", "Responsável", "Telefone", "Status", "Motivo"])
         full_row_table_polish(self.table)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.cellDoubleClicked.connect(lambda row, col: self.edit_record(row))
+        self.table.itemActivated.connect(lambda item: self.edit_record(item.row()))
+        self.table.itemSelectionChanged.connect(self.update_action_state)
         layout.addWidget(title)
         layout.addWidget(subtitle)
         panel_layout.addLayout(card_header)
@@ -1203,6 +1248,12 @@ class PatientsPage(QWidget):
         widths = [220, 120, 220, 130, 90, 320]
         for col, width in enumerate(widths):
             self.table.setColumnWidth(col, width)
+        self.update_action_state()
+
+    def update_action_state(self) -> None:
+        has_selection = self.table.currentRow() >= 0
+        self.edit_btn.setEnabled(has_selection)
+        self.delete_btn.setEnabled(has_selection)
 
     def current(self, row: int | None = None) -> dict[str, Any] | None:
         idx = self.table.currentRow() if row is None else row
@@ -1993,7 +2044,7 @@ class AgendaPage(QWidget):
             )
             text = QLabel(label)
             text.setAlignment(Qt.AlignCenter)
-            text.setStyleSheet(f"background: transparent; color: {COLORS['muted']}; font-size: 11px; font-weight: 700;")
+            text.setStyleSheet(f"background: transparent; color: {COLORS['muted']}; font-size: 13px; font-weight: 700;")
             item.addWidget(number)
             item.addWidget(text)
             stats_layout.addLayout(item, index // 2, index % 2)
@@ -2952,7 +3003,7 @@ class BulkAppointmentEditDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.MultiSelection)
         self.table.verticalHeader().setDefaultSectionSize(44)
         self.table.setShowGrid(False)
-        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.setFocusPolicy(Qt.StrongFocus)
         check_icon = resource_path("check_white.svg").as_posix()
         self.table.setStyleSheet(
             self.table.styleSheet()
@@ -4319,7 +4370,7 @@ class FinancePage(QWidget):
         box.setSpacing(6)
         text = QLabel(label)
         text.setObjectName("Muted")
-        text.setStyleSheet("background: transparent; font-size: 12px; font-weight: 700;")
+        text.setStyleSheet("background: transparent; font-size: 13px; font-weight: 700;")
         box.addWidget(text)
         box.addWidget(widget)
         return box
@@ -5131,7 +5182,7 @@ class LegacyPatientReceiptDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.MultiSelection)
         self.table.verticalHeader().setDefaultSectionSize(44)
         self.table.setShowGrid(False)
-        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.setFocusPolicy(Qt.StrongFocus)
         check_icon = resource_path("check_white.svg").as_posix()
         self.table.setStyleSheet(
             self.table.styleSheet()
@@ -5471,7 +5522,7 @@ class LegacyProfessionalPayoutDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.MultiSelection)
         self.table.verticalHeader().setDefaultSectionSize(44)
         self.table.setShowGrid(False)
-        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.setFocusPolicy(Qt.StrongFocus)
         check_icon = resource_path("check_white.svg").as_posix()
         self.table.setStyleSheet(
             self.table.styleSheet()
@@ -5804,7 +5855,7 @@ class FinancialTransactionDialog(QDialog):
         self.table.setItemDelegate(FinancialRowDelegate(self.table))
         self.table.verticalHeader().setDefaultSectionSize(44)
         self.table.setMinimumHeight(44 * 6 + 38)
-        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.setFocusPolicy(Qt.StrongFocus)
         check_icon = resource_path("check_white.svg").as_posix()
         self.table.setStyleSheet(
             self.table.styleSheet()
@@ -6345,16 +6396,21 @@ class DocumentsPage(QWidget):
         filters.setSpacing(14)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Buscar documento...")
+        self.search.setAccessibleName("Buscar documento")
         self.search.setMinimumWidth(360)
         self.search.textChanged.connect(lambda _text="": self.refresh())
         self.professional_filter = QComboBox()
+        self.professional_filter.setAccessibleName("Filtrar documentos por profissional")
         self.professional_filter.setMinimumWidth(260)
         self.professional_filter.currentIndexChanged.connect(lambda _index=0: self.refresh())
         upload_btn = button("Enviar documento")
+        upload_btn.setAccessibleName("Enviar novo documento")
         upload_btn.clicked.connect(self.upload_document)
         download_btn = button("Baixar", secondary=True)
+        download_btn.setAccessibleName("Baixar documento selecionado")
         download_btn.clicked.connect(self.download_selected)
         delete_btn = button("Excluir documento", danger=True)
+        delete_btn.setAccessibleName("Excluir documento selecionado")
         delete_btn.clicked.connect(self.delete_selected)
         filters.addWidget(self.search, 1)
         filters.addWidget(self.professional_filter)
@@ -6377,11 +6433,12 @@ class DocumentsPage(QWidget):
         header.addWidget(self.badge)
 
         self.table = QTableWidget(0, 6)
+        self.table.setAccessibleName("Lista de documentos")
         self.table.setHorizontalHeaderLabels(["Documento", "Profissional", "Tipo", "Tamanho", "Enviado em", "Descrição"])
         full_row_table_polish(self.table)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.itemDoubleClicked.connect(lambda item: self.download_selected())
+        self.table.itemActivated.connect(lambda _item: self.download_selected())
         panel_layout.addLayout(header)
         panel_layout.addWidget(self.table, 1)
 
