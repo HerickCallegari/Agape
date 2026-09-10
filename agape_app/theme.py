@@ -40,6 +40,15 @@ QWidget {{
     font-family: Segoe UI, Arial;
     font-size: 14px;
 }}
+QLabel {{
+    background: transparent;
+}}
+QWidget#AgendaPeriodsEditor,
+QWidget#AgendaPeriodsRows,
+QFrame#AgendaPeriodRow {{
+    background: transparent;
+    border: none;
+}}
 QMainWindow {{
     background: {COLORS["bg"]};
 }}
@@ -105,6 +114,15 @@ QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QDateEdit:focus, QTimeEdit:fo
     border: 2px solid {COLORS["primary"]};
     padding: 8px 9px;
 }}
+QTimeEdit#CompactAgendaTime {{
+    min-height: 22px;
+    max-height: 30px;
+    padding: 4px 8px;
+    border-radius: 6px;
+}}
+QTimeEdit#CompactAgendaTime:focus {{
+    padding: 3px 7px;
+}}
 QPushButton {{
     background: {COLORS["primary"]};
     color: white;
@@ -127,6 +145,12 @@ QPushButton[secondary="true"] {{
 }}
 QPushButton[secondary="true"]:hover {{
     background: {COLORS["pink_card"]};
+}}
+QPushButton#CompactAgendaAction {{
+    min-height: 24px;
+    max-height: 30px;
+    padding: 4px 10px;
+    border-radius: 6px;
 }}
 QPushButton[danger="true"] {{
     background: {COLORS["red"]};

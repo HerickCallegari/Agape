@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import httpx
 from PySide6.QtCore import QThreadPool
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QScrollArea, QTabWidget, QWidget
 
 from agape_app.app import (
     AGENDA_KIND,
@@ -19,7 +19,10 @@ from agape_app.app import (
     BulkAppointmentEditDialog,
     DashboardPage,
     RecurringDialog,
+    NewUserDialog,
     build_agenda_grid_rows,
+    agenda_duration_field,
+    agenda_time_field,
     friendly_error_message,
 )
 from agape_app.repository import SupabaseRepository
@@ -139,6 +142,34 @@ class AgendaGridRuleTests(unittest.TestCase):
         self.assertEqual(rows[0]["start_time"], "08:00:00")
         self.assertEqual(rows[-1]["end_time"], "12:00:00")
 
+    def test_multiple_periods_do_not_generate_slots_during_break(self):
+        self.professional["agenda_periods"] = [
+            {"start": "07:30:00", "end": "12:00:00"},
+            {"start": "13:00:00", "end": "17:30:00"},
+        ]
+        self.professional.update({"agenda_slot_minutes": 50, "agenda_step_minutes": 60})
+
+        rows = build_agenda_grid_rows([self.professional], [])
+        starts = [row["start_time"] for row in rows]
+
+        self.assertIn("10:30:00", starts)
+        self.assertIn("11:30:00", starts)
+        self.assertIn("13:00:00", starts)
+        self.assertNotIn("12:30:00", starts)
+        self.assertTrue(all(row["start_time"] < "12:00:00" or row["start_time"] >= "13:00:00" for row in rows))
+
+    def test_period_end_limits_start_but_does_not_clip_appointment_duration(self):
+        self.professional.update({
+            "agenda_periods": [{"start": "13:00:00", "end": "18:00:00"}],
+            "agenda_slot_minutes": 40,
+            "agenda_step_minutes": 40,
+        })
+
+        rows = build_agenda_grid_rows([self.professional], [])
+
+        self.assertEqual(rows[-1]["start_time"], "17:40:00")
+        self.assertEqual(rows[-1]["end_time"], "18:20:00")
+
     def test_appointment_marks_overlapping_slot_as_occupied(self):
         row = appointment("one", "09:00:00")
 
@@ -171,6 +202,15 @@ class AgendaGridRuleTests(unittest.TestCase):
         occupied = [item for item in rows if item[AGENDA_KIND] == "appointment"]
         self.assertEqual(len(occupied), 1)
         self.assertEqual(occupied[0]["id"], "early")
+
+    def test_late_appointment_outside_grid_remains_visible(self):
+        row = appointment("late", "20:00:00")
+
+        rows = build_agenda_grid_rows([self.professional], [row])
+
+        occupied = [item for item in rows if item[AGENDA_KIND] == "appointment"]
+        self.assertEqual(len(occupied), 1)
+        self.assertEqual(occupied[0]["start_time"], "20:00:00")
 
     def test_fifty_minute_appointments_can_start_every_hour_without_drifting(self):
         self.professional.update({"agenda_slot_minutes": 50, "agenda_step_minutes": 60})
@@ -285,6 +325,23 @@ class AppointmentDurationDefaultsTests(unittest.TestCase):
         self.assertEqual(values["end_time"], "08:40:00")
         dialog.deleteLater()
 
+    def test_manual_appointment_can_be_created_outside_standard_periods(self):
+        dialog = AppointmentDialog(
+            self.parent,
+            object(),
+            date.today(),
+            patients=self.patients,
+            professionals=self.professionals,
+            selected_professional_id="professional-40",
+            selected_start_time="20:00:00",
+        )
+
+        values = dialog.values()
+
+        self.assertEqual(values["start_time"], "20:00:00")
+        self.assertEqual(values["end_time"], "20:40:00")
+        dialog.deleteLater()
+
     def test_recurring_schedule_uses_selected_professional_duration(self):
         dialog = RecurringDialog(
             self.parent,
@@ -300,6 +357,33 @@ class AppointmentDurationDefaultsTests(unittest.TestCase):
         self.assertEqual(values["end_time"], "08:40:00")
         dialog.deleteLater()
 
+
+class EmployeeAgendaLayoutTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_agenda_tab_has_a_single_scroll_area(self):
+        dialog = NewUserDialog(None)
+        tabs = dialog.findChild(QTabWidget)
+        scroll_areas = dialog.findChildren(QScrollArea)
+
+        self.assertEqual(tabs.tabText(2), "Agenda")
+        self.assertEqual(len(scroll_areas), 1)
+        dialog.deleteLater()
+
+    def test_mouse_wheel_is_ignored_by_agenda_value_fields(self):
+        class WheelEvent:
+            ignored = False
+
+            def ignore(self):
+                self.ignored = True
+
+        for field in (agenda_time_field("08:00", "08:00"), agenda_duration_field(60)):
+            event = WheelEvent()
+            field.wheelEvent(event)
+            self.assertTrue(event.ignored)
+            field.deleteLater()
 
 class AgendaRefreshTests(unittest.TestCase):
     @classmethod

@@ -27,6 +27,10 @@ class SupabaseRepository:
     DEFAULT_AGENDA_END_TIME = "18:00:00"
     DEFAULT_AGENDA_SLOT_MINUTES = 60
     DEFAULT_AGENDA_STEP_MINUTES = 60
+    DEFAULT_AGENDA_PERIODS = [
+        {"start": "08:00:00", "end": "11:00:00"},
+        {"start": "13:00:00", "end": "18:00:00"},
+    ]
     DOCUMENTS_BUCKET = "professional-documents"
     MAX_DOCUMENT_SIZE_BYTES = 20 * 1024 * 1024
     SUPABASE_IN_FILTER_BATCH_SIZE = 75
@@ -282,7 +286,7 @@ class SupabaseRepository:
         try:
             rows = (
                 self.client.table("professionals")
-                .select("id, agenda_start_time, agenda_end_time, agenda_slot_minutes, agenda_step_minutes")
+                .select("id, agenda_start_time, agenda_end_time, agenda_periods, agenda_slot_minutes, agenda_step_minutes")
                 .eq("profile_id", profile_id)
                 .limit(1)
                 .execute()
@@ -306,8 +310,36 @@ class SupabaseRepository:
         return rows[0] if rows else None
 
     def professional_agenda_values(self, values: dict[str, Any]) -> dict[str, Any]:
-        agenda_start_time = values.get("agenda_start_time", self.DEFAULT_AGENDA_START_TIME)
-        agenda_end_time = values.get("agenda_end_time", self.DEFAULT_AGENDA_END_TIME)
+        raw_periods = values.get("agenda_periods")
+        if raw_periods is None:
+            raw_periods = [{
+                "start": values.get("agenda_start_time", self.DEFAULT_AGENDA_START_TIME),
+                "end": values.get("agenda_end_time", self.DEFAULT_AGENDA_END_TIME),
+            }]
+        if not isinstance(raw_periods, list) or not raw_periods:
+            raise AppError("Adicione pelo menos um período de atendimento.")
+
+        agenda_periods: list[dict[str, str]] = []
+        for index, period in enumerate(raw_periods, start=1):
+            if not isinstance(period, dict):
+                raise AppError(f"O período {index} é inválido.")
+            start = str(period.get("start") or "")[:8]
+            end = str(period.get("end") or "")[:8]
+            if len(start) == 5:
+                start += ":00"
+            if len(end) == 5:
+                end += ":00"
+            if not start or not end or end <= start:
+                raise AppError(f"O horário final da grade no período {index} deve ser maior que o inicial.")
+            agenda_periods.append({"start": start, "end": end})
+
+        agenda_periods.sort(key=lambda period: period["start"])
+        for previous, current in zip(agenda_periods, agenda_periods[1:]):
+            if current["start"] < previous["end"]:
+                raise AppError("Os períodos de atendimento não podem se sobrepor.")
+
+        agenda_start_time = agenda_periods[0]["start"]
+        agenda_end_time = agenda_periods[-1]["end"]
         try:
             agenda_slot_minutes = int(values.get("agenda_slot_minutes", self.DEFAULT_AGENDA_SLOT_MINUTES))
         except (TypeError, ValueError):
@@ -318,8 +350,6 @@ class SupabaseRepository:
             )
         except (TypeError, ValueError):
             raise AppError("Informe durações válidas para os horários da grade.") from None
-        if agenda_end_time <= agenda_start_time:
-            raise AppError("O horário final da grade deve ser maior que o horário inicial.")
         if not 5 <= agenda_slot_minutes <= 480:
             raise AppError("A duração dos horários deve ficar entre 5 e 480 minutos.")
         if not agenda_slot_minutes <= agenda_step_minutes <= 480:
@@ -327,6 +357,7 @@ class SupabaseRepository:
         return {
             "agenda_start_time": agenda_start_time,
             "agenda_end_time": agenda_end_time,
+            "agenda_periods": agenda_periods,
             "agenda_slot_minutes": agenda_slot_minutes,
             "agenda_step_minutes": agenda_step_minutes,
         }

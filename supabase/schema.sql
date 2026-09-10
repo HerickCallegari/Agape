@@ -53,6 +53,7 @@ create table if not exists public.professionals (
   phone text,
   agenda_start_time time not null default '08:00:00',
   agenda_end_time time not null default '18:00:00',
+  agenda_periods jsonb not null default '[{"start":"08:00:00","end":"11:00:00"},{"start":"13:00:00","end":"18:00:00"}]'::jsonb,
   agenda_slot_minutes integer not null default 60,
   agenda_step_minutes integer not null default 60,
   is_active boolean not null default true,

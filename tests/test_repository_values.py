@@ -161,6 +161,12 @@ class ProfessionalAgendaConfigurationTests(unittest.TestCase):
                 "agenda_slot_minutes": 60,
             })
 
+    def test_default_agenda_has_morning_and_afternoon_periods(self):
+        self.assertEqual(SupabaseRepository.DEFAULT_AGENDA_PERIODS, [
+            {"start": "08:00:00", "end": "11:00:00"},
+            {"start": "13:00:00", "end": "18:00:00"},
+        ])
+
     def test_start_interval_cannot_be_shorter_than_appointment_duration(self):
         with self.assertRaisesRegex(AppError, "intervalo entre novos horários"):
             self.repo.professional_agenda_values({
@@ -168,6 +174,31 @@ class ProfessionalAgendaConfigurationTests(unittest.TestCase):
                 "agenda_end_time": "18:00:00",
                 "agenda_slot_minutes": 50,
                 "agenda_step_minutes": 40,
+            })
+
+    def test_multiple_agenda_periods_are_sorted_and_preserve_compatibility_range(self):
+        values = self.repo.professional_agenda_values({
+            "agenda_periods": [
+                {"start": "13:00", "end": "17:30"},
+                {"start": "07:30", "end": "12:00"},
+            ],
+            "agenda_slot_minutes": 50,
+            "agenda_step_minutes": 60,
+        })
+
+        self.assertEqual(values["agenda_start_time"], "07:30:00")
+        self.assertEqual(values["agenda_end_time"], "17:30:00")
+        self.assertEqual(values["agenda_periods"][1]["start"], "13:00:00")
+
+    def test_overlapping_agenda_periods_are_rejected(self):
+        with self.assertRaisesRegex(AppError, "não podem se sobrepor"):
+            self.repo.professional_agenda_values({
+                "agenda_periods": [
+                    {"start": "08:00", "end": "12:00"},
+                    {"start": "11:00", "end": "15:00"},
+                ],
+                "agenda_slot_minutes": 60,
+                "agenda_step_minutes": 60,
             })
 
     def test_grid_migration_is_additive_and_does_not_touch_appointments(self):
