@@ -65,3 +65,10 @@ Alteração e exclusão de recebimentos/repasses usam RPCs. A edição preserva 
 vinculados e altera data, valor efetivo e forma. A exclusão apaga o cabeçalho e itens
 em cascata e recalcula `payment_status`/`professional_payout_status` considerando
 eventuais outras movimentações que ainda referenciem o atendimento.
+
+## 2026-09-23 — Atendimento com recebimento não pode ser excluído
+
+A exclusão individual ou em lote consulta primeiro os itens de recebimento vinculados.
+Se algum atendimento possuir recebimento registrado, toda a exclusão é interrompida e
+o usuário é orientado a excluir ou estornar o recebimento no Financeiro. A restrição de
+chave estrangeira permanece como proteção adicional, com tradução para mensagem amigável.

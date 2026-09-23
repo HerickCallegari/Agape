@@ -375,6 +375,11 @@ def log_exception(context: str, exc: Exception) -> None:
 
 def friendly_error_message(exc: Exception) -> str:
     raw = str(exc)
+    if "patient_payment_items_appointment_id_fkey" in raw:
+        return (
+            "Este atendimento possui um recebimento registrado e não pode ser excluído. "
+            "Exclua ou estorne o recebimento no Financeiro antes de excluir o atendimento."
+        )
     if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException)):
         return "O servidor demorou para responder. Verifique sua conexão e tente novamente."
     if isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):

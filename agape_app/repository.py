@@ -917,15 +917,32 @@ class SupabaseRepository:
     def delete_appointment(self, appointment_id: str) -> None:
         if not appointment_id:
             raise AppError("Atendimento não encontrado para exclusão.")
+        self._ensure_appointments_have_no_patient_payments([appointment_id])
         self.client.table("appointments").delete().eq("id", appointment_id).execute()
 
     def delete_appointments_bulk(self, appointment_ids: list[str]) -> int:
         unique_ids = list(dict.fromkeys(appointment_id for appointment_id in appointment_ids if appointment_id))
+        self._ensure_appointments_have_no_patient_payments(unique_ids)
         deleted_count = 0
         for batch in self._batched_ids(unique_ids):
             result = self.client.table("appointments").delete().in_("id", batch).execute()
             deleted_count += len(result.data or batch)
         return deleted_count
+
+    def _ensure_appointments_have_no_patient_payments(self, appointment_ids: list[str]) -> None:
+        linked_items = self.patient_payment_items_for_appointments(appointment_ids)
+        if not linked_items:
+            return
+        linked_count = len({item.get("appointment_id") for item in linked_items if item.get("appointment_id")})
+        if linked_count > 1:
+            message = (
+                f"{linked_count} atendimentos selecionados possuem recebimentos registrados e não podem ser excluídos. "
+            )
+        else:
+            message = "Este atendimento possui um recebimento registrado e não pode ser excluído. "
+        raise AppError(
+            message + "Exclua ou estorne o recebimento no Financeiro antes de excluir o atendimento."
+        )
 
     def session_note_for(self, appointment_id: str) -> dict[str, Any] | None:
         rows = self.client.table("session_notes").select("*").eq("appointment_id", appointment_id).execute().data or []

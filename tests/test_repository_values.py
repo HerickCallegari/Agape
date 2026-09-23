@@ -3,7 +3,7 @@ import types
 import unittest
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 if "supabase" not in sys.modules:
@@ -47,6 +47,31 @@ class RepositoryValueTests(unittest.TestCase):
     def test_negative_consultation_fee_is_rejected(self):
         with self.assertRaises(AppError):
             self.repo.parse_consultation_fee("-1")
+
+    def test_delete_appointment_with_patient_payment_is_blocked_with_guidance(self):
+        self.repo.client = MagicMock()
+        self.repo.patient_payment_items_for_appointments = MagicMock(
+            return_value=[{"appointment_id": "appointment-1", "is_paid": True}]
+        )
+
+        with self.assertRaisesRegex(AppError, "Exclua ou estorne o recebimento no Financeiro"):
+            self.repo.delete_appointment("appointment-1")
+
+        self.repo.client.table.assert_not_called()
+
+    def test_bulk_delete_with_patient_payments_is_blocked_before_any_deletion(self):
+        self.repo.client = MagicMock()
+        self.repo.patient_payment_items_for_appointments = MagicMock(
+            return_value=[
+                {"appointment_id": "appointment-1", "is_paid": True},
+                {"appointment_id": "appointment-2", "is_paid": True},
+            ]
+        )
+
+        with self.assertRaisesRegex(AppError, "2 atendimentos selecionados"):
+            self.repo.delete_appointments_bulk(["appointment-1", "appointment-2"])
+
+        self.repo.client.table.assert_not_called()
 
     def test_patient_birth_date_accepts_brazilian_format(self):
         self.assertEqual(
