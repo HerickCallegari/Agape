@@ -1,22 +1,38 @@
 #!/bin/bash
 set -euo pipefail
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "Este script precisa ser executado no macOS." >&2
+report_unexpected_error() {
+  local status=$?
+  local line="${BASH_LINENO[0]:-desconhecida}"
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::error title=Falha ao gerar DMG universal::Comando inesperadamente encerrado na linha $line (código $status)."
+  fi
+  exit "$status"
+}
+trap report_unexpected_error ERR
+
+fail() {
+  local message="$1"
+  echo "$message" >&2
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::error title=Falha ao gerar DMG universal::$message"
+  fi
   exit 1
+}
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  fail "Este script precisa ser executado no macOS."
 fi
 
 if [[ "$#" -ne 2 ]]; then
-  echo "Uso: $0 CAMINHO_APP_ARM64 CAMINHO_APP_X64" >&2
-  exit 1
+  fail "Uso: $0 CAMINHO_APP_ARM64 CAMINHO_APP_X64"
 fi
 
 arm_app="$1"
 x64_app="$2"
 for app in "$arm_app" "$x64_app"; do
   if [[ ! -d "$app/Contents/MacOS" || ! -f "$app/Contents/Info.plist" ]]; then
-    echo "Bundle macOS inválido: $app" >&2
-    exit 1
+    fail "Bundle macOS inválido: $app"
   fi
 done
 
@@ -30,21 +46,12 @@ for plist_key in CFBundleIdentifier CFBundleShortVersionString CFBundleExecutabl
   arm_value="$(/usr/libexec/PlistBuddy -c "Print :$plist_key" "$arm_app/Contents/Info.plist")"
   x64_value="$(/usr/libexec/PlistBuddy -c "Print :$plist_key" "$x64_app/Contents/Info.plist")"
   if [[ "$arm_value" != "$x64_value" ]]; then
-    echo "Os bundles divergem em $plist_key: ARM=$arm_value, Intel=$x64_value." >&2
-    exit 1
+    fail "Os bundles divergem em $plist_key: ARM=$arm_value, Intel=$x64_value."
   fi
 done
 
-(cd "$arm_app" && find . \( -type f -o -type l \) -print | LC_ALL=C sort) > "$work_dir/arm-files.txt"
-(cd "$x64_app" && find . \( -type f -o -type l \) -print | LC_ALL=C sort) > "$work_dir/x64-files.txt"
-if ! diff -u "$work_dir/arm-files.txt" "$work_dir/x64-files.txt"; then
-  echo "Os bundles ARM e Intel possuem conjuntos de arquivos diferentes." >&2
-  exit 1
-fi
-
 if ! cmp -s "$arm_app/Contents/Resources/.env" "$x64_app/Contents/Resources/.env"; then
-  echo "A configuração pública incluída nos bundles ARM e Intel é diferente." >&2
-  exit 1
+  fail "A configuração pública incluída nos bundles ARM e Intel é diferente."
 fi
 
 universal_app="$work_dir/ClinicaAgape.app"
@@ -59,19 +66,16 @@ while IFS= read -r -d '' arm_binary; do
   relative_path="${arm_binary#"$arm_app"/}"
   x64_binary="$x64_app/$relative_path"
   if [[ ! -f "$x64_binary" ]] || ! file -b "$x64_binary" | grep -q '^Mach-O'; then
-    echo "Binário Intel correspondente não encontrado: $relative_path" >&2
-    exit 1
+    fail "Binário Intel correspondente não encontrado: $relative_path"
   fi
 
   arm_arches="$(lipo -archs "$arm_binary")"
   x64_arches="$(lipo -archs "$x64_binary")"
   if [[ " $arm_arches " != *" arm64 "* ]]; then
-    echo "Slice ARM ausente em $relative_path: $arm_arches" >&2
-    exit 1
+    fail "Slice ARM ausente em $relative_path: $arm_arches"
   fi
   if [[ " $x64_arches " != *" x86_64 "* ]]; then
-    echo "Slice Intel ausente em $relative_path: $x64_arches" >&2
-    exit 1
+    fail "Slice Intel ausente em $relative_path: $x64_arches"
   fi
 
   arm_slice="$work_dir/slice-$index-arm64"
@@ -92,10 +96,47 @@ while IFS= read -r -d '' x64_binary; do
   relative_path="${x64_binary#"$x64_app"/}"
   arm_binary="$arm_app/$relative_path"
   if [[ ! -f "$arm_binary" ]] || ! file -b "$arm_binary" | grep -q '^Mach-O'; then
-    echo "Binário ARM correspondente não encontrado: $relative_path" >&2
-    exit 1
+    fail "Binário ARM correspondente não encontrado: $relative_path"
   fi
 done < <(find "$x64_app" -type f -print0)
+
+# Recursos não executáveis podem variar entre wheels de arquiteturas distintas.
+# O bundle ARM é a base; inclua recursos exclusivos do Intel sem substituir
+# binários ou arquivos compartilhados. Todo Mach-O continua obrigado a existir
+# nos dois bundles e é unido explicitamente acima.
+while IFS= read -r -d '' x64_item; do
+  relative_path="${x64_item#"$x64_app"/}"
+  universal_item="$universal_app/$relative_path"
+
+  if [[ -L "$x64_item" ]]; then
+    if [[ -L "$universal_item" ]]; then
+      x64_target="$(readlink "$x64_item")"
+      universal_target="$(readlink "$universal_item")"
+      if [[ "$x64_target" != "$universal_target" ]]; then
+        fail "Links simbólicos divergentes em $relative_path."
+      fi
+      continue
+    fi
+    if [[ -e "$universal_item" ]]; then
+      fail "Conflito de tipo ao incluir recurso Intel: $relative_path"
+    fi
+    mkdir -p "$(dirname "$universal_item")"
+    ln -s "$(readlink "$x64_item")" "$universal_item"
+    continue
+  fi
+
+  if [[ -L "$universal_item" ]]; then
+    fail "Conflito de tipo ao incluir recurso Intel: $relative_path"
+  fi
+  if [[ -e "$universal_item" ]]; then
+    continue
+  fi
+  if file -b "$x64_item" | grep -q '^Mach-O'; then
+    fail "Binário Intel sem correspondente no bundle ARM: $relative_path"
+  fi
+  mkdir -p "$(dirname "$universal_item")"
+  ditto "$x64_item" "$universal_item"
+done < <(find "$x64_app" \( -type f -o -type l \) -print0)
 
 while IFS= read -r -d '' candidate; do
   if ! file -b "$candidate" | grep -q '^Mach-O'; then
@@ -103,8 +144,7 @@ while IFS= read -r -d '' candidate; do
   fi
   arches="$(lipo -archs "$candidate")"
   if [[ " $arches " != *" arm64 "* || " $arches " != *" x86_64 "* ]]; then
-    echo "Binário universal incompleto: $candidate ($arches)." >&2
-    exit 1
+    fail "Binário universal incompleto: $candidate ($arches)."
   fi
 done < <(find "$universal_app" -type f -print0)
 
