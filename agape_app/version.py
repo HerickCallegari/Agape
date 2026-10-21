@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.22"
 UPDATE_REPOSITORY = "HerickCallegari/Agape"
 WINDOWS_UPDATE_ASSET_NAME = "ClinicaAgape-Setup.exe"
 MACOS_UNIVERSAL_UPDATE_ASSET_NAME = "ClinicaAgape-macOS-universal.dmg"

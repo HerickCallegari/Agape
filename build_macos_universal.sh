@@ -58,6 +58,13 @@ fi
 universal_app="$work_dir/ClinicaAgape.app"
 ditto "$arm_app" "$universal_app"
 
+is_allowed_arch_specific_binary() {
+  local relative_path="$1"
+  local arch="$2"
+
+  [[ "$relative_path" == "Contents/Frameworks/ossl-modules/legacy.dylib" && "$arch" == "x86_64" ]]
+}
+
 extract_slice() {
   local binary="$1"
   local arch="$2"
@@ -80,6 +87,9 @@ while IFS= read -r -d '' arm_binary; do
   relative_path="${arm_binary#"$arm_app"/}"
   x64_binary="$x64_app/$relative_path"
   if [[ ! -f "$x64_binary" ]] || ! file -b "$x64_binary" | grep -q '^Mach-O'; then
+    if is_allowed_arch_specific_binary "$relative_path" arm64; then
+      continue
+    fi
     fail "Binário Intel correspondente não encontrado: $relative_path"
   fi
 
@@ -110,6 +120,12 @@ while IFS= read -r -d '' x64_binary; do
   relative_path="${x64_binary#"$x64_app"/}"
   arm_binary="$arm_app/$relative_path"
   if [[ ! -f "$arm_binary" ]] || ! file -b "$arm_binary" | grep -q '^Mach-O'; then
+    if is_allowed_arch_specific_binary "$relative_path" x86_64; then
+      universal_binary="$universal_app/$relative_path"
+      mkdir -p "$(dirname "$universal_binary")"
+      ditto "$x64_binary" "$universal_binary"
+      continue
+    fi
     fail "Binário ARM correspondente não encontrado: $relative_path"
   fi
 done < <(find "$x64_app" -type f -print0)
@@ -157,9 +173,14 @@ while IFS= read -r -d '' candidate; do
     continue
   fi
   arches="$(lipo -archs "$candidate")"
-  if [[ " $arches " != *" arm64 "* || " $arches " != *" x86_64 "* ]]; then
-    fail "Binário universal incompleto: $candidate ($arches)."
+  if [[ " $arches " == *" arm64 "* && " $arches " == *" x86_64 "* ]]; then
+    continue
   fi
+  relative_path="${candidate#"$universal_app"/}"
+  if [[ "$arches" == "x86_64" ]] && is_allowed_arch_specific_binary "$relative_path" x86_64; then
+    continue
+  fi
+  fail "Binário universal incompleto: $candidate ($arches)."
 done < <(find "$universal_app" -type f -print0)
 
 # A união dos slices invalida as assinaturas ad-hoc originais; assine o bundle final.

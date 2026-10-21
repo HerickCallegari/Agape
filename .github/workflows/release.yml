@@ -152,7 +152,7 @@ jobs:
 
   build-macos-universal:
     needs: build-macos-slices
-    runs-on: macos-15
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
