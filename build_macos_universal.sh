@@ -2,14 +2,15 @@
 set -euo pipefail
 
 report_unexpected_error() {
-  local status=$?
-  local line="${BASH_LINENO[0]:-desconhecida}"
+  local status="$1"
+  local line="$2"
+  local command="$3"
   if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-    echo "::error title=Falha ao gerar DMG universal::Comando inesperadamente encerrado na linha $line (código $status)."
+    echo "::error title=Falha ao gerar DMG universal::Comando '$command' encerrado na linha $line (código $status)."
   fi
   exit "$status"
 }
-trap report_unexpected_error ERR
+trap 'report_unexpected_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 fail() {
   local message="$1"
@@ -57,6 +58,19 @@ fi
 universal_app="$work_dir/ClinicaAgape.app"
 ditto "$arm_app" "$universal_app"
 
+extract_slice() {
+  local binary="$1"
+  local arch="$2"
+  local arches="$3"
+  local output="$4"
+
+  if [[ "$arches" == "$arch" ]]; then
+    ditto "$binary" "$output"
+  else
+    lipo "$binary" -thin "$arch" -output "$output"
+  fi
+}
+
 index=0
 while IFS= read -r -d '' arm_binary; do
   if ! file -b "$arm_binary" | grep -q '^Mach-O'; then
@@ -81,8 +95,8 @@ while IFS= read -r -d '' arm_binary; do
   arm_slice="$work_dir/slice-$index-arm64"
   x64_slice="$work_dir/slice-$index-x86_64"
   merged_binary="$work_dir/slice-$index-universal2"
-  lipo "$arm_binary" -thin arm64 -output "$arm_slice"
-  lipo "$x64_binary" -thin x86_64 -output "$x64_slice"
+  extract_slice "$arm_binary" arm64 "$arm_arches" "$arm_slice"
+  extract_slice "$x64_binary" x86_64 "$x64_arches" "$x64_slice"
   lipo -create "$arm_slice" "$x64_slice" -output "$merged_binary"
   chmod "$(stat -f '%Lp' "$arm_binary")" "$merged_binary"
   mv "$merged_binary" "$universal_app/$relative_path"
