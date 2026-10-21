@@ -1,4 +1,4 @@
-name: Publicar aplicativo Windows
+name: Publicar aplicativo Windows e macOS
 
 on:
   workflow_dispatch:
@@ -6,11 +6,15 @@ on:
     tags:
       - "v*.*.*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +25,7 @@ jobs:
           cache: pip
 
       - name: Validar versão da tag
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
@@ -55,20 +60,145 @@ jobs:
       - name: Instalar Inno Setup
         run: choco install innosetup --no-progress -y
 
-      - name: Gerar instalador
+      - name: Gerar instalador e checksum
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $source = Get-Content "agape_app\version.py" -Raw
+          if ($source -notmatch 'APP_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') {
+            throw "APP_VERSION inválida em agape_app/version.py."
+          }
+          $version = $Matches[1]
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" installer.iss
-
-      - name: Gerar checksum
-        shell: pwsh
-        run: |
+          if ($LASTEXITCODE -ne 0) {
+            throw "O Inno Setup falhou com código $LASTEXITCODE."
+          }
           $file = "release\ClinicaAgape-Setup.exe"
           $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
           "$hash  ClinicaAgape-Setup.exe" | Set-Content "$file.sha256" -Encoding ascii
 
-      - name: Publicar GitHub Release
+      - name: Armazenar pacote Windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            release/ClinicaAgape-Setup.exe
+            release/ClinicaAgape-Setup.exe.sha256
+          if-no-files-found: error
+
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            asset_arch: arm64
+            minimum_macos: "14.0"
+          - runner: macos-15-intel
+            asset_arch: x64
+            minimum_macos: "15.0"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Validar versão da tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from agape_app.version import APP_VERSION
+
+          expected = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          if APP_VERSION != expected:
+              raise SystemExit(f"APP_VERSION {APP_VERSION} não corresponde à tag {expected}.")
+          PY
+
+      - name: Instalar dependências
+        run: python -m pip install -r requirements.txt
+
+      - name: Executar testes
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Preparar configuração pública do Supabase
+        shell: bash
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [[ -z "$SUPABASE_URL" || -z "$SUPABASE_ANON_KEY" ]]; then
+            echo "Configure os secrets SUPABASE_URL e SUPABASE_ANON_KEY no repositório." >&2
+            exit 1
+          fi
+          umask 077
+          printf 'SUPABASE_URL=%s\nSUPABASE_ANON_KEY=%s\n' "$SUPABASE_URL" "$SUPABASE_ANON_KEY" > .env
+
+      - name: Gerar aplicativo e DMG
+        shell: bash
+        env:
+          AGAPE_MACOS_MIN_VERSION: ${{ matrix.minimum_macos }}
+        run: bash ./build_macos.sh "${{ matrix.asset_arch }}"
+
+      - name: Armazenar pacote macOS
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.asset_arch }}
+          path: |
+            release/ClinicaAgape-macOS-${{ matrix.asset_arch }}.dmg
+            release/ClinicaAgape-macOS-${{ matrix.asset_arch }}.dmg.sha256
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Baixar todos os pacotes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Validar conjunto e checksums
+        shell: bash
+        run: |
+          expected=(
+            ClinicaAgape-Setup.exe
+            ClinicaAgape-macOS-arm64.dmg
+            ClinicaAgape-macOS-x64.dmg
+          )
+          for asset in "${expected[@]}"; do
+            test -f "release/$asset"
+            test -f "release/$asset.sha256"
+            (cd release && sha256sum -c "$asset.sha256")
+          done
+
+      - name: Publicar GitHub Release completo
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" release/ClinicaAgape-Setup.exe release/ClinicaAgape-Setup.exe.sha256 --generate-notes --title "Clínica Ágape ${{ github.ref_name }}"
+        run: |
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if [[ "$(gh release view "$tag" --json isDraft --jq .isDraft)" != "true" ]]; then
+              echo "A release $tag já está publicada e não pode ter artefatos substituídos." >&2
+              exit 1
+            fi
+          else
+            gh release create "$tag" --verify-tag --draft --generate-notes --title "Clínica Ágape $tag"
+          fi
+          gh release upload "$tag" release/* --clobber
+          gh release edit "$tag" --draft=false

@@ -1,5 +1,7 @@
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -15,7 +17,20 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    load_dotenv()
+    if getattr(sys, "frozen", False):
+        candidates = [
+            Path(sys.executable).resolve().parent / ".env",
+            Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)) / ".env",
+        ]
+        if sys.platform == "darwin":
+            candidates.append(Path(sys.executable).resolve().parent.parent / "Resources" / ".env")
+        env_file = next((path for path in candidates if path.is_file()), None)
+        if env_file is not None:
+            load_dotenv(dotenv_path=env_file)
+        else:
+            load_dotenv()
+    else:
+        load_dotenv()
     supabase_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
     if supabase_url.endswith("/rest/v1"):
         supabase_url = supabase_url.removesuffix("/rest/v1").rstrip("/")

@@ -53,7 +53,7 @@ from .financial_rules import appointment_is_selectable, current_month_period
 from .permissions import Permission, ROLE_LABELS, can
 from .repository import AppError, SupabaseRepository
 from .theme import APP_STYLESHEET, COLORS, STATUS_COLORS
-from .updater import ReleaseInfo, download_installer, latest_release
+from .updater import ReleaseInfo, download_installer, latest_release, update_launch_command
 from .version import APP_VERSION
 
 STATUSES = ["Agendado", "Confirmado", "Atendido", "Falta com aviso", "Falta sem aviso", "Cancelado"]
@@ -271,8 +271,14 @@ def configure_logger() -> logging.Logger:
     if logger.handlers:
         return logger
 
-    base_dir = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    log_dir = base_dir / "ClinicaAgape" / "logs"
+    if sys.platform == "darwin":
+        log_dir = Path.home() / "Library" / "Logs" / "ClinicaAgape"
+    elif sys.platform == "win32":
+        base_dir = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        log_dir = base_dir / "ClinicaAgape" / "logs"
+    else:
+        base_dir = Path(os.getenv("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+        log_dir = base_dir / "ClinicaAgape" / "logs"
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         handler: logging.Handler = RotatingFileHandler(
@@ -488,10 +494,16 @@ def start_update_check(app: QApplication, parent: QWidget) -> None:
 
         def install_update(installer_path: str) -> None:
             try:
-                subprocess.Popen(
-                    [installer_path, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
-                    close_fds=True,
-                )
+                if sys.platform == "darwin":
+                    QMessageBox.information(
+                        parent,
+                        "Atualização pronta",
+                        "Ao confirmar, o Clínica Agape será fechado e a imagem de instalação será aberta. "
+                        "Arraste Clínica Agape para Aplicativos e confirme a substituição. Como esta é uma "
+                        "distribuição interna sem assinatura Apple, o macOS pode pedir que você autorize a "
+                        "nova versão em Privacidade e Segurança.",
+                    )
+                subprocess.Popen(update_launch_command(installer_path), close_fds=True)
                 app.quit()
             except Exception as exc:
                 show_error(parent, exc)

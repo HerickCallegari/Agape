@@ -29,6 +29,7 @@ release/
 *.pyzw
 *.exe
 *.msi
+*.dmg
 
 # Supabase local CLI state
 supabase/.branches/
