@@ -19,6 +19,10 @@ minimum_macos = os.environ.get('AGAPE_MACOS_MIN_VERSION', '').strip()
 if not minimum_macos:
     raise RuntimeError('AGAPE_MACOS_MIN_VERSION não foi definida pelo script de build.')
 
+target_arch = os.environ.get('AGAPE_MACOS_TARGET_ARCH', '').strip()
+if target_arch not in {'arm64', 'x86_64'}:
+    raise RuntimeError('AGAPE_MACOS_TARGET_ARCH deve ser arm64 ou x86_64.')
+
 a = Analysis(
     ['main.py'],
     pathex=[],
@@ -47,7 +51,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    target_arch=target_arch,
     codesign_identity=None,
     entitlements_file=None,
     icon=['agape_app/assets/app_icon.ico'],

@@ -4,23 +4,24 @@ Esta distribuição é destinada aos computadores autorizados da Clínica Ágape
 não é publicada na Mac App Store e não possui assinatura Developer ID nem
 notarização da Apple.
 
-## Escolher o pacote
+## Pacote compatível
 
-- Mac com processador Apple M1, M2, M3, M4 ou posterior:
-  `ClinicaAgape-macOS-arm64.dmg` (macOS 14 ou posterior).
-- Mac com processador Intel: `ClinicaAgape-macOS-x64.dmg` (macOS 15 ou posterior).
+Baixe `ClinicaAgape-macOS-universal.dmg`. O mesmo pacote funciona em Macs com
+processador Intel e com chips Apple M1, M2, M3, M4 ou posteriores. É necessário usar
+o macOS 15 ou posterior.
 
 Em **Menu Apple > Sobre Este Mac**, o campo Chip mostra Apple quando o computador é
-Apple Silicon; modelos Intel exibem Processador Intel.
+Apple Silicon; modelos Intel exibem Processador Intel. Essa informação não altera o
+arquivo que deve ser baixado, mas ajuda no diagnóstico de incompatibilidades.
 
 ## Verificar o download
 
 Baixe também o arquivo `.sha256` correspondente. No Terminal, entre na pasta dos
-downloads e execute, trocando o nome conforme a arquitetura:
+downloads e execute:
 
 ```bash
 cd ~/Downloads
-shasum -a 256 -c ClinicaAgape-macOS-arm64.dmg.sha256
+shasum -a 256 -c ClinicaAgape-macOS-universal.dmg.sha256
 ```
 
 Continue somente se o resultado terminar em `OK`.
@@ -40,7 +41,7 @@ de terceiros para remover a segurança do computador.
 
 ## Atualizar
 
-Quando uma nova versão for oferecida, o sistema baixa o DMG correto, valida o
+Quando uma nova versão for oferecida, o sistema baixa o DMG universal, valida o
 SHA-256 e o abre. Arraste novamente Clínica Agape para Aplicativos, confirme a
 substituição e reabra o programa. Uma nova versão pode exigir outra autorização em
 Privacidade e Segurança.

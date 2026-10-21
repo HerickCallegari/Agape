@@ -13,8 +13,7 @@ from agape_app.updater import (
     version_tuple,
 )
 from agape_app.version import (
-    MACOS_ARM64_UPDATE_ASSET_NAME,
-    MACOS_X64_UPDATE_ASSET_NAME,
+    MACOS_UNIVERSAL_UPDATE_ASSET_NAME,
     WINDOWS_UPDATE_ASSET_NAME,
 )
 
@@ -35,11 +34,15 @@ class UpdaterPlatformTests(unittest.TestCase):
     def test_windows_keeps_legacy_installer_name(self):
         self.assertEqual(update_asset_name("win32", "AMD64"), WINDOWS_UPDATE_ASSET_NAME)
 
-    def test_apple_silicon_uses_arm64_dmg(self):
-        self.assertEqual(update_asset_name("darwin", "arm64"), MACOS_ARM64_UPDATE_ASSET_NAME)
+    def test_apple_silicon_uses_universal_dmg(self):
+        self.assertEqual(update_asset_name("darwin", "arm64"), MACOS_UNIVERSAL_UPDATE_ASSET_NAME)
 
-    def test_intel_mac_uses_x64_dmg(self):
-        self.assertEqual(update_asset_name("darwin", "x86_64"), MACOS_X64_UPDATE_ASSET_NAME)
+    def test_intel_mac_uses_universal_dmg(self):
+        self.assertEqual(update_asset_name("darwin", "x86_64"), MACOS_UNIVERSAL_UPDATE_ASSET_NAME)
+
+    def test_unsupported_mac_architecture_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "Arquitetura de Mac não suportada"):
+            update_asset_name("darwin", "powerpc")
 
     def test_unsupported_platform_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "não são suportadas"):
@@ -58,8 +61,8 @@ class UpdaterPlatformTests(unittest.TestCase):
 
     def test_macos_update_command_opens_dmg_without_shell(self):
         self.assertEqual(
-            update_launch_command("/tmp/ClinicaAgape-macOS-arm64.dmg", "darwin"),
-            ["/usr/bin/open", "/tmp/ClinicaAgape-macOS-arm64.dmg"],
+            update_launch_command("/tmp/ClinicaAgape-macOS-universal.dmg", "darwin"),
+            ["/usr/bin/open", "/tmp/ClinicaAgape-macOS-universal.dmg"],
         )
 
 
@@ -93,7 +96,7 @@ class FakeDownloadResponse:
 
 class UpdaterReleaseTests(unittest.TestCase):
     @patch("agape_app.updater.httpx.get")
-    def test_latest_release_selects_matching_macos_asset_and_checksum(self, mocked_get):
+    def test_latest_release_selects_universal_macos_asset_and_checksum(self, mocked_get):
         mocked_get.return_value = FakeJsonResponse(
             {
                 "tag_name": "v1.0.18",
@@ -101,12 +104,12 @@ class UpdaterReleaseTests(unittest.TestCase):
                 "assets": [
                     {"name": WINDOWS_UPDATE_ASSET_NAME, "browser_download_url": "https://example.test/windows"},
                     {
-                        "name": MACOS_ARM64_UPDATE_ASSET_NAME,
-                        "browser_download_url": "https://example.test/macos-arm64",
+                        "name": MACOS_UNIVERSAL_UPDATE_ASSET_NAME,
+                        "browser_download_url": "https://example.test/macos-universal",
                     },
                     {
-                        "name": f"{MACOS_ARM64_UPDATE_ASSET_NAME}.sha256",
-                        "browser_download_url": "https://example.test/macos-arm64-sha",
+                        "name": f"{MACOS_UNIVERSAL_UPDATE_ASSET_NAME}.sha256",
+                        "browser_download_url": "https://example.test/macos-universal-sha",
                     },
                 ],
             }
@@ -115,15 +118,15 @@ class UpdaterReleaseTests(unittest.TestCase):
         release = latest_release("1.0.17", platform_name="darwin", machine="arm64")
 
         self.assertIsNotNone(release)
-        self.assertEqual(release.asset_name, MACOS_ARM64_UPDATE_ASSET_NAME)
-        self.assertEqual(release.installer_url, "https://example.test/macos-arm64")
-        self.assertEqual(release.checksum_url, "https://example.test/macos-arm64-sha")
+        self.assertEqual(release.asset_name, MACOS_UNIVERSAL_UPDATE_ASSET_NAME)
+        self.assertEqual(release.installer_url, "https://example.test/macos-universal")
+        self.assertEqual(release.checksum_url, "https://example.test/macos-universal-sha")
 
     @patch("agape_app.updater.httpx.get")
     def test_missing_platform_asset_has_clear_error(self, mocked_get):
         mocked_get.return_value = FakeJsonResponse({"tag_name": "v1.0.18", "assets": []})
 
-        with self.assertRaisesRegex(RuntimeError, MACOS_X64_UPDATE_ASSET_NAME):
+        with self.assertRaisesRegex(RuntimeError, MACOS_UNIVERSAL_UPDATE_ASSET_NAME):
             latest_release("1.0.17", platform_name="darwin", machine="x86_64")
 
     @patch("agape_app.updater.httpx.get")
@@ -142,14 +145,14 @@ class UpdaterReleaseTests(unittest.TestCase):
         payload = b"macOS dmg content"
         checksum = hashlib.sha256(payload).hexdigest()
         checksum_response = MagicMock()
-        checksum_response.text = f"{checksum}  {MACOS_ARM64_UPDATE_ASSET_NAME}"
+        checksum_response.text = f"{checksum}  {MACOS_UNIVERSAL_UPDATE_ASSET_NAME}"
         checksum_response.raise_for_status.return_value = None
         release = ReleaseInfo(
             version="1.0.18",
             installer_url="https://example.test/installer",
             checksum_url="https://example.test/checksum",
             notes="",
-            asset_name=MACOS_ARM64_UPDATE_ASSET_NAME,
+            asset_name=MACOS_UNIVERSAL_UPDATE_ASSET_NAME,
         )
 
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp_dir:
@@ -160,20 +163,20 @@ class UpdaterReleaseTests(unittest.TestCase):
             ):
                 target = download_installer(release)
 
-            self.assertEqual(target.name, MACOS_ARM64_UPDATE_ASSET_NAME)
+            self.assertEqual(target.name, MACOS_UNIVERSAL_UPDATE_ASSET_NAME)
             self.assertEqual(target.read_bytes(), payload)
             self.assertTrue(str(target).startswith(str(Path(temp_dir))))
 
     def test_download_removes_file_when_checksum_does_not_match(self):
         checksum_response = MagicMock()
-        checksum_response.text = f"{'0' * 64}  {MACOS_ARM64_UPDATE_ASSET_NAME}"
+        checksum_response.text = f"{'0' * 64}  {MACOS_UNIVERSAL_UPDATE_ASSET_NAME}"
         checksum_response.raise_for_status.return_value = None
         release = ReleaseInfo(
             version="1.0.18",
             installer_url="https://example.test/installer",
             checksum_url="https://example.test/checksum",
             notes="",
-            asset_name=MACOS_ARM64_UPDATE_ASSET_NAME,
+            asset_name=MACOS_UNIVERSAL_UPDATE_ASSET_NAME,
         )
 
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp_dir:

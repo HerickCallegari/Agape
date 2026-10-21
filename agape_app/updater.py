@@ -11,8 +11,7 @@ from pathlib import Path
 import httpx
 
 from .version import (
-    MACOS_ARM64_UPDATE_ASSET_NAME,
-    MACOS_X64_UPDATE_ASSET_NAME,
+    MACOS_UNIVERSAL_UPDATE_ASSET_NAME,
     UPDATE_ASSET_NAME,
     UPDATE_REPOSITORY,
     WINDOWS_UPDATE_ASSET_NAME,
@@ -44,10 +43,8 @@ def update_asset_name(platform_name: str | None = None, machine: str | None = No
         return WINDOWS_UPDATE_ASSET_NAME
     if current_platform == "darwin":
         current_machine = (machine or platform.machine()).strip().lower()
-        if current_machine in {"arm64", "aarch64"}:
-            return MACOS_ARM64_UPDATE_ASSET_NAME
-        if current_machine in {"x86_64", "amd64", "x64"}:
-            return MACOS_X64_UPDATE_ASSET_NAME
+        if current_machine in {"arm64", "aarch64", "x86_64", "amd64", "x64"}:
+            return MACOS_UNIVERSAL_UPDATE_ASSET_NAME
         raise RuntimeError(f"Arquitetura de Mac não suportada para atualização: {current_machine or 'desconhecida'}.")
     raise RuntimeError(f"Atualizações automáticas não são suportadas nesta plataforma: {current_platform}.")
 

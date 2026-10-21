@@ -44,6 +44,7 @@ if [[ "${minimum_macos%%.*}" != "$host_macos_major" ]]; then
   exit 1
 fi
 export AGAPE_MACOS_MIN_VERSION="$minimum_macos"
+export AGAPE_MACOS_TARGET_ARCH="$binary_arch"
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/clinica-agape-build.XXXXXX")"
 cleanup() {
@@ -64,15 +65,27 @@ if [[ ! -x "$app_executable" ]]; then
   echo "O bundle macOS não contém o executável esperado." >&2
   exit 1
 fi
-if ! file "$app_executable" | grep -q "$binary_arch"; then
-  echo "O executável gerado não corresponde à arquitetura $binary_arch." >&2
-  file "$app_executable" >&2
-  exit 1
-fi
 if [[ ! -f "$bundled_env" ]]; then
   echo "O bundle macOS não contém a configuração pública saneada." >&2
   exit 1
 fi
+
+validate_native_binary() {
+  local binary="$1"
+  local arches
+  arches="$(lipo -archs "$binary")"
+  if [[ " $arches " != *" $binary_arch "* ]]; then
+    echo "Binário sem a arquitetura $binary_arch: $binary ($arches)." >&2
+    return 1
+  fi
+}
+
+validate_native_binary "$app_executable"
+while IFS= read -r -d '' candidate; do
+  if file -b "$candidate" | grep -q '^Mach-O'; then
+    validate_native_binary "$candidate"
+  fi
+done < <(find "$app_bundle" -type f -print0)
 
 # Assinatura ad-hoc: garante integridade estrutural, mas não substitui Developer ID/notarização.
 codesign --force --deep --sign - "$app_bundle"
@@ -97,5 +110,7 @@ hdiutil verify "release/$asset_name"
   cd release
   shasum -a 256 "$asset_name" > "$asset_name.sha256"
 )
+
+tar -czf "release/ClinicaAgape-macOS-${detected_arch}.app.tar.gz" -C dist ClinicaAgape.app
 
 echo "Pacote gerado em release/$asset_name"

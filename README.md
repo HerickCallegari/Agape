@@ -17,7 +17,7 @@ Principais módulos disponíveis:
 - Exportação de sessões por paciente para apoio na criação de pareceres e relatórios.
 - Financeiro com abas de resumo, recebimentos, repasses e atendimentos.
 - Configurações para gerenciamento de funcionários, permissões, status ativo, especialidade e vínculo com agenda.
-- Builds nativos para Windows, macOS Apple Silicon e macOS Intel com PyInstaller.
+- Builds nativos para Windows e macOS universal2 com PyInstaller.
 
 ## Tecnologias
 
@@ -73,7 +73,8 @@ O financeiro considera o valor associado ao atendimento e separa os resultados e
 │       └── reset-user-password/
 │           └── index.ts    # Edge Function para redefinição de senha
 ├── build_windows.ps1       # Script de build para Windows
-├── build_macos.sh          # Script de build e DMG para macOS
+├── build_macos.sh          # Gera um slice nativo do aplicativo macOS
+├── build_macos_universal.sh # Une os slices e gera o DMG universal
 ├── prepare_public_env.py   # Saneia a configuração incluída nos pacotes
 ├── ClinicaAgape.spec       # Configuração do PyInstaller
 ├── ClinicaAgape-macOS.spec # Configuração do bundle .app
@@ -159,26 +160,29 @@ A pasta `dist/` é artefato de build e não deve ser versionada.
 
 ## Build para macOS
 
-O build precisa ser executado no próprio macOS. Instale as dependências, mantenha
-`SUPABASE_URL` e `SUPABASE_ANON_KEY` no `.env` e execute:
-
-```bash
-python -m pip install -r requirements.txt
-bash ./build_macos.sh
-```
-
-O script detecta a arquitetura e gera um dos pacotes:
+O build precisa ser executado no próprio macOS. O workflow oficial gera separadamente
+os slices Apple Silicon e Intel, une cada binário Mach-O e publica o pacote:
 
 ```text
-release/ClinicaAgape-macOS-arm64.dmg  # Apple Silicon
-release/ClinicaAgape-macOS-x64.dmg    # Intel
+release/ClinicaAgape-macOS-universal.dmg  # Apple Silicon e Intel
 ```
 
-O workflow gera o pacote Apple Silicon em um runner macOS 14 e o pacote Intel em um
-runner macOS 15; os pacotes declaram essas versões como seus respectivos mínimos.
-Ambos usam assinatura ad-hoc, sem Developer ID e sem notarização, sendo destinados
-à distribuição interna. Antes da entrega, valide o primeiro artefato em um Mac real e
-consulte [as instruções de instalação interna](MACOS_INTERNAL_INSTALLATION.md).
+O workflow gera ambos os slices no macOS 15, confirma que cada binário do resultado
+contém as arquiteturas `arm64` e `x86_64` e executa um smoke test do mesmo DMG em
+runners Apple Silicon e Intel. O aplicativo declara macOS 15 como versão mínima e
+usa assinatura ad-hoc, sem Developer ID e sem notarização, sendo destinado à
+distribuição interna. Antes da entrega, valide o primeiro artefato em um Mac real e consulte
+[as instruções de instalação interna](MACOS_INTERNAL_INSTALLATION.md).
+
+Para reproduzir o processo manualmente, execute `build_macos.sh arm64` em um Mac
+Apple Silicon e `build_macos.sh x64` em um Mac Intel, extraia os dois arquivos
+`.app.tar.gz` e passe os respectivos bundles para `build_macos_universal.sh`. O GitHub
+Actions é o caminho recomendado porque executa e valida todas essas etapas.
+
+As releases também mantêm cópias do DMG universal com os nomes antigos `arm64` e
+`x64`. Esses aliases existem somente para que instalações anteriores à adoção do
+universal2 continuem encontrando atualizações; novos downloads devem usar o arquivo
+`ClinicaAgape-macOS-universal.dmg`.
 
 Os scripts de build nunca copiam o `.env` completo: o pacote recebe somente
 `SUPABASE_URL` e `SUPABASE_ANON_KEY` e rejeita qualquer `SUPABASE_SERVICE_ROLE_KEY`.
@@ -187,7 +191,7 @@ Os scripts de build nunca copiam o `.env` completo: o pacote recebe somente
 
 O executável consulta a versão mais recente publicada nos Releases do repositório
 `HerickCallegari/Agape`. Quando existe uma versão superior, o aplicativo escolhe o
-pacote compatível com o sistema e a arquitetura e valida seu SHA-256. No Windows o
+instalador Windows ou o DMG universal do macOS e valida seu SHA-256. No Windows o
 instalador é iniciado silenciosamente. No macOS o DMG é aberto e a substituição do
 aplicativo é concluída manualmente pelo usuário.
 
@@ -200,13 +204,13 @@ Para preparar uma versão:
 4. Com a árvore de trabalho limpa, execute:
 
 ```powershell
-.\publish.ps1 -Version 1.0.18
+.\publish.ps1 -Version 1.0.19
 ```
 
 O script executa os testes e envia branch e tag atomicamente. O workflow do GitHub
-Actions compila Windows, macOS Apple Silicon e macOS Intel, calcula os checksums e
-publica todos os pacotes juntos no mesmo GitHub Release. Acompanhe a execução na aba
-**Actions** do GitHub.
+Actions compila Windows e o aplicativo universal do macOS, testa o DMG nas duas
+arquiteturas, calcula os checksums e publica todos os pacotes juntos no mesmo GitHub
+Release. Acompanhe a execução na aba **Actions** do GitHub.
 
 Antes da primeira publicação, o workflow também pode ser executado manualmente pela
 aba **Actions**. Nesse modo ele compila e disponibiliza os artefatos para validação,
