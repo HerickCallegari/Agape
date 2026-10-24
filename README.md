@@ -207,7 +207,7 @@ Para preparar uma versão:
 4. Com a árvore de trabalho limpa, execute:
 
 ```powershell
-.\publish.ps1 -Version 1.0.23
+.\publish.ps1 -Version 1.0.24
 ```
 
 O script executa os testes e envia branch e tag atomicamente. O workflow do GitHub

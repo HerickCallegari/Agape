@@ -223,6 +223,57 @@ jobs:
           }
           trap cleanup EXIT
 
+          emit_error() {
+            local title="$1"
+            local message="$2"
+            message="${message//%/%25}"
+            message="${message//$'\r'/%0D}"
+            message="${message//$'\n'/%0A}"
+            echo "::error title=$title::$message"
+          }
+
+          current_phase="verificação inicial"
+          report_unexpected_error() {
+            local status=$?
+            emit_error \
+              "Smoke test macOS ${{ matrix.runtime_arch }}" \
+              "Falha na fase '$current_phase': comando '$BASH_COMMAND' (código $status)."
+            exit "$status"
+          }
+          trap report_unexpected_error ERR
+
+          smoke_executable() {
+            local label="$1"
+            local command="$2"
+            local log="$3"
+            local app_pid
+            local status
+            local excerpt
+
+            current_phase="inicialização do $label"
+            env QT_QPA_PLATFORM=offscreen /usr/bin/arch "${{ matrix.arch_flag }}" "$command" >"$log" 2>&1 &
+            app_pid=$!
+            for attempt in {1..5}; do
+              sleep 1
+              if ! kill -0 "$app_pid" 2>/dev/null; then
+                set +e
+                wait "$app_pid"
+                status=$?
+                set -e
+                cat "$log"
+                excerpt="$(tail -n 20 "$log" | sed -E 's/eyJ[A-Za-z0-9._-]{20,}/[redacted]/g' | tr '\r\n' '  ' | cut -c1-1500)"
+                emit_error \
+                  "Falha no $label (${{ matrix.runtime_arch }})" \
+                  "O processo encerrou com código $status. Log: ${excerpt:-sem saída}"
+                return 1
+              fi
+            done
+            kill "$app_pid"
+            wait "$app_pid" 2>/dev/null || true
+            cat "$log"
+          }
+
+          current_phase="verificação do DMG"
           hdiutil verify "$dmg"
           hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount_dir"
           app="$mount_dir/ClinicaAgape.app"
@@ -237,24 +288,14 @@ jobs:
           native_arches="$(lipo -archs "$native_executable")"
           [[ " $native_arches " == *" ${{ matrix.runtime_arch }} "* ]]
 
-          log="$RUNNER_TEMP/clinica-agape-${{ matrix.runtime_arch }}.log"
-          env QT_QPA_PLATFORM=offscreen /usr/bin/arch "${{ matrix.arch_flag }}" "$executable" >"$log" 2>&1 &
-          app_pid=$!
-          for attempt in {1..10}; do
-            sleep 1
-            if ! kill -0 "$app_pid" 2>/dev/null; then
-              set +e
-              wait "$app_pid"
-              status=$?
-              set -e
-              cat "$log"
-              echo "O aplicativo encerrou durante o smoke test com código $status." >&2
-              exit 1
-            fi
-          done
-          kill "$app_pid"
-          wait "$app_pid" 2>/dev/null || true
-          cat "$log"
+          smoke_executable \
+            "bundle nativo" \
+            "$native_executable" \
+            "$RUNNER_TEMP/clinica-agape-native-${{ matrix.runtime_arch }}.log"
+          smoke_executable \
+            "launcher universal" \
+            "$executable" \
+            "$RUNNER_TEMP/clinica-agape-launcher-${{ matrix.runtime_arch }}.log"
 
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
