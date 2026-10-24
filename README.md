@@ -171,9 +171,11 @@ release/ClinicaAgape-macOS-universal.dmg  # Apple Silicon e Intel
 
 O launcher contém as arquiteturas `arm64` e `x86_64`, detecta a arquitetura em execução
 e inicia o bundle PyInstaller correspondente. O workflow executa um smoke test do mesmo
-DMG em runners Apple Silicon e Intel. O aplicativo declara macOS 15 como versão mínima
-e usa assinatura ad-hoc, sem Developer ID e sem notarização, sendo destinado à
-distribuição interna. Antes da entrega, valide o primeiro artefato em um Mac real e consulte
+DMG em runners Apple Silicon e Intel. No runner Intel, `cryptography` é compilado com
+ligação estática ao OpenSSL 3 para evitar dependências incompatíveis no pacote. O aplicativo
+declara macOS 15 como versão mínima e usa assinatura ad-hoc, sem Developer ID e sem
+notarização, sendo destinado à distribuição interna. Antes da entrega, valide o primeiro
+artefato em um Mac real e consulte
 [as instruções de instalação interna](MACOS_INTERNAL_INSTALLATION.md).
 
 Para reproduzir o processo manualmente, execute `build_macos.sh arm64` em um Mac
@@ -207,7 +209,7 @@ Para preparar uma versão:
 4. Com a árvore de trabalho limpa, execute:
 
 ```powershell
-.\publish.ps1 -Version 1.0.24
+.\publish.ps1 -Version 1.0.25
 ```
 
 O script executa os testes e envia branch e tag atomicamente. O workflow do GitHub
