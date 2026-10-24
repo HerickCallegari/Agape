@@ -17,7 +17,7 @@ Principais módulos disponíveis:
 - Exportação de sessões por paciente para apoio na criação de pareceres e relatórios.
 - Financeiro com abas de resumo, recebimentos, repasses e atendimentos.
 - Configurações para gerenciamento de funcionários, permissões, status ativo, especialidade e vínculo com agenda.
-- Builds nativos para Windows e macOS universal2 com PyInstaller.
+- Builds nativos para Windows e um único pacote macOS compatível com Apple Silicon e Intel.
 
 ## Tecnologias
 
@@ -74,7 +74,8 @@ O financeiro considera o valor associado ao atendimento e separa os resultados e
 │           └── index.ts    # Edge Function para redefinição de senha
 ├── build_windows.ps1       # Script de build para Windows
 ├── build_macos.sh          # Gera um slice nativo do aplicativo macOS
-├── build_macos_universal.sh # Une os slices e gera o DMG universal
+├── build_macos_universal.sh # Empacota os apps nativos no DMG universal
+├── macos_launcher.c        # Launcher universal2 para selecionar o app nativo
 ├── prepare_public_env.py   # Saneia a configuração incluída nos pacotes
 ├── ClinicaAgape.spec       # Configuração do PyInstaller
 ├── ClinicaAgape-macOS.spec # Configuração do bundle .app
@@ -161,29 +162,29 @@ A pasta `dist/` é artefato de build e não deve ser versionada.
 ## Build para macOS
 
 O build precisa ser executado no próprio macOS. O workflow oficial gera separadamente
-os slices Apple Silicon e Intel, une cada binário Mach-O e publica o pacote:
+os aplicativos Apple Silicon e Intel, inclui os dois bundles nativos intactos atrás de
+um launcher universal2 e publica um único pacote:
 
 ```text
 release/ClinicaAgape-macOS-universal.dmg  # Apple Silicon e Intel
 ```
 
-O workflow gera ambos os slices no macOS 15, confirma que cada binário compartilhado
-contém as arquiteturas `arm64` e `x86_64` e executa um smoke test do mesmo DMG em
-runners Apple Silicon e Intel. O único binário específico permitido é o provedor
-opcional legado do OpenSSL incluído apenas pela distribuição Python Intel. O aplicativo
-declara macOS 15 como versão mínima e usa assinatura ad-hoc, sem Developer ID e sem
-notarização, sendo destinado à distribuição interna. Antes da entrega, valide o primeiro
-artefato em um Mac real e consulte
+O launcher contém as arquiteturas `arm64` e `x86_64`, detecta a arquitetura em execução
+e inicia o bundle PyInstaller correspondente. O workflow executa um smoke test do mesmo
+DMG em runners Apple Silicon e Intel. O aplicativo declara macOS 15 como versão mínima
+e usa assinatura ad-hoc, sem Developer ID e sem notarização, sendo destinado à
+distribuição interna. Antes da entrega, valide o primeiro artefato em um Mac real e consulte
 [as instruções de instalação interna](MACOS_INTERNAL_INSTALLATION.md).
 
 Para reproduzir o processo manualmente, execute `build_macos.sh arm64` em um Mac
 Apple Silicon e `build_macos.sh x64` em um Mac Intel, extraia os dois arquivos
-`.app.tar.gz` e passe os respectivos bundles para `build_macos_universal.sh`. O GitHub
-Actions é o caminho recomendado porque executa e valida todas essas etapas.
+`.app.tar.gz` e passe os respectivos bundles para `build_macos_universal.sh`. O script
+compila `macos_launcher.c` como universal2 e preserva os executáveis PyInstaller nativos.
+O GitHub Actions é o caminho recomendado porque executa e valida todas essas etapas.
 
 As releases também mantêm cópias do DMG universal com os nomes antigos `arm64` e
 `x64`. Esses aliases existem somente para que instalações anteriores à adoção do
-universal2 continuem encontrando atualizações; novos downloads devem usar o arquivo
+pacote único continuem encontrando atualizações; novos downloads devem usar o arquivo
 `ClinicaAgape-macOS-universal.dmg`.
 
 Os scripts de build nunca copiam o `.env` completo: o pacote recebe somente
@@ -206,7 +207,7 @@ Para preparar uma versão:
 4. Com a árvore de trabalho limpa, execute:
 
 ```powershell
-.\publish.ps1 -Version 1.0.22
+.\publish.ps1 -Version 1.0.23
 ```
 
 O script executa os testes e envia branch e tag atomicamente. O workflow do GitHub

@@ -227,11 +227,15 @@ jobs:
           hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount_dir"
           app="$mount_dir/ClinicaAgape.app"
           executable="$app/Contents/MacOS/ClinicaAgape"
+          native_executable="$app/Contents/Resources/native/${{ matrix.runtime_arch }}/ClinicaAgape.app/Contents/MacOS/ClinicaAgape"
           codesign --verify --deep --strict "$app"
 
           binary_arches="$(lipo -archs "$executable")"
           [[ " $binary_arches " == *" arm64 "* ]]
           [[ " $binary_arches " == *" x86_64 "* ]]
+          test -x "$native_executable"
+          native_arches="$(lipo -archs "$native_executable")"
+          [[ " $native_arches " == *" ${{ matrix.runtime_arch }} "* ]]
 
           log="$RUNNER_TEMP/clinica-agape-${{ matrix.runtime_arch }}.log"
           env QT_QPA_PLATFORM=offscreen /usr/bin/arch "${{ matrix.arch_flag }}" "$executable" >"$log" 2>&1 &
